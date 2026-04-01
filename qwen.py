@@ -1,6 +1,7 @@
 import os
 from openai import OpenAI
 import json
+from render import render_json
 
 # 模型列表: https://help.aliyun.com/model-studio/getting-started/models
 
@@ -11,17 +12,16 @@ client = OpenAI(
 
 
 
-chatlogs = 'test.json'
+chatlogs = 'chatlogs/demo.json'
 
 question = \
 """
-OpenAI的SDK里, llm call有四个role分别是system、user、assistant、tool，共同组成了上下文。先不管tool，想问你哪个是大家常说的prompt？system和assistant区别在哪？
 """
 question = question.strip()
 
 
 
-def ask_qwen(chatlogs_json, user_query):
+def ask_qwen(chatlogs_json, user_query, render=True):
 
     with open(chatlogs_json) as f:
         conversation_context = json.load(f)
@@ -51,11 +51,12 @@ def ask_qwen(chatlogs_json, user_query):
     with open(chatlogs_json, 'w') as f:
         json.dump(conversation_context, f, indent=4, ensure_ascii=False)
     
-    return llm_reply['content']
+    if render:
+        render_json(chatlogs_json)
 
 
 
 
 
 if __name__ == '__main__':
-    ask_qwen(chatlogs, question)
+    ask_qwen(chatlogs, question, True)
