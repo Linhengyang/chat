@@ -5,6 +5,7 @@ You are a helpful assistant.
 
 
 >**user**:
+
 你是谁?
 
 
@@ -14,6 +15,7 @@ You are a helpful assistant.
 
 
 >**user**:
+
 重复我的问题
 
 
@@ -23,6 +25,7 @@ You are a helpful assistant.
 
 
 >**user**:
+
 OpenAI的SDK里, llm call有四个role分别是system、user、assistant、tool，共同组成了上下文。先不管tool，想问你哪个是大家常说的prompt？system和assistant区别在哪？
 
 
