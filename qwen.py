@@ -58,4 +58,4 @@ def ask_qwen(chatlogs_json, user_query):
 
 
 if __name__ == '__main__':
-    print(ask_qwen(chatlogs, question), file='render.md')
+    ask_qwen(chatlogs, question)
