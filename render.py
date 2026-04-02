@@ -15,8 +15,16 @@ def render_json(chatlogs_json):
         conversations = json.load(f)
 
     for paragraph in conversations:
-        role = f'''\n>**{paragraph['role']}**:\n'''
-        if paragraph['role'] != 'user':
+        if paragraph['role'] == 'user':
+            role = f'''\n---\n🙋**{paragraph['role']}**:\n---\n'''
+        elif paragraph['role'] == 'assistant':
+            role = f'''\n---\n🤖**{paragraph['role']}**:\n---\n'''
+        else:
+            role = f'''**{paragraph['role']}**:'''
+
+        if paragraph['role'] == 'user':
+            content = f'''\n```{paragraph['content']}\n```\n'''
+        elif paragraph['role'] == 'assistant':
             content = f'''\n{paragraph['content']}\n\n'''
         else:
             content = f'''{paragraph['content']}\n\n'''
@@ -30,4 +38,4 @@ def render_json(chatlogs_json):
 
 
 if __name__ == "__main__":
-    render_json('chatlogs/demo.json')
+    render_json('chatlogs/cpp_heap.json')
