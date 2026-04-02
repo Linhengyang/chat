@@ -23,7 +23,7 @@ def render_json(chatlogs_json):
             role = f'''**{paragraph['role']}**:'''
 
         if paragraph['role'] == 'user':
-            content = f'''\n```{paragraph['content']}\n```\n'''
+            content = f'''```\n{paragraph['content']}\n```\n'''
         elif paragraph['role'] == 'assistant':
             content = f'''\n{paragraph['content']}\n\n'''
         else:

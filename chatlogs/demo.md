@@ -1,35 +1,44 @@
-
->**system**:
-
-You are a helpful assistant.
+**system**:You are a helpful assistant.
 
 
->**user**:
-
+---
+🙋**user**:
+---
+```
 你是谁?
+```
 
-
->**assistant**:
+---
+🤖**assistant**:
+---
 
 你好！我是 Qwen3.5，阿里巴巴最新推出的通义千问大语言模型。我擅长回答问题、创作文字、编程、逻辑推理等，支持全球 100 多种语言。有什么需要帮助的，尽管告诉我！ 😊
 
 
->**user**:
-
+---
+🙋**user**:
+---
+```
 重复我的问题
+```
 
-
->**assistant**:
+---
+🤖**assistant**:
+---
 
 你是谁？
 
 
->**user**:
-
+---
+🙋**user**:
+---
+```
 OpenAI的SDK里, llm call有四个role分别是system、user、assistant、tool，共同组成了上下文。先不管tool，想问你哪个是大家常说的prompt？system和assistant区别在哪？
+```
 
-
->**assistant**:
+---
+🤖**assistant**:
+---
 
 这是一个非常好的问题，触及了大模型交互的核心概念。在 OpenAI 的 Chat Completion API 中，这几个角色的定义确实容易让人混淆。我来帮你梳理一下：
 
