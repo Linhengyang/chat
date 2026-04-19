@@ -1267,3 +1267,467 @@ __pycache__/
 
 这样在不同环境（本地开发、Docker、K8s、云平台）部署时，你就知道该在哪里配置了！
 
+
+---
+🙋**user**:
+---
+```
+帮我生成一个测试用request脚本。
+```
+
+---
+🤖**assistant**:
+---
+
+## 测试请求脚本
+
+我为你创建了一个完整的测试脚本，包含多种测试场景和清晰的输出。
+
+### `tests/test_api.py`
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+债券交易 LLM 抽取服务 - API 测试脚本
+使用方法：python tests/test_api.py
+"""
+
+import httpx
+import json
+import time
+from typing import Optional
+from datetime import datetime
+
+# ==================== 配置 ====================
+BASE_URL = "http://localhost:8000"
+API_ENDPOINT = "/api/v1/llm/extract-transaction"
+TIMEOUT = 60  # 秒
+
+# ==================== 测试数据 ====================
+
+def get_base_input() -> dict:
+    """基础输入数据模板"""
+    return {
+        "timestamp": "2026/02/10 10:26:06",
+        "content": "",  # 测试时填充
+        "fromCorpName": "XX 证券股份有限公司",
+        "fromName": "赵钱",
+        "fromOpenID": "wx_from_openid_123",
+        "fromQQ": "0123456789",
+        "msgUniqueID": f"msg_{int(time.time())}_{id}",
+        "toCorpName": "YY 基金管理有限公司",
+        "toGroupName": "债券交易群",
+        "toGroupOpenID": "qq_group_openid_456",
+        "toName": "孙李",
+        "toOpenID": "wx_to_openid_789",
+        "toQQ": "0987654321",
+        "toQQGroup": "9876543210"
+    }
+
+# 测试用例 1: 标准债券交易消息
+TEST_CASE_1 = {
+    "name": "标准债券交易 - 使用默认 schema",
+    "input": {
+        **get_base_input(),
+        "content": "出 24 国债 01，净价 99.5，量 1000 万，T+0 清算，有意向的私"
+    },
+    "config": {}  # 使用默认配置
+}
+
+# 测试用例 2: 指定 output_schema
+TEST_CASE_2 = {
+    "name": "标准债券交易 - 指定 v1_standard schema",
+    "input": {
+        **get_base_input(),
+        "content": "收 23 进出 10，全价 101.2，5000 万，bid 方向"
+    },
+    "config": {
+        "output_schema": "v1_standard",
+        "model_version": "qwen-max",
+        "temperature": 0.1
+    }
+}
+
+# 测试用例 3: 群聊消息
+TEST_CASE_3 = {
+    "name": "群聊交易消息",
+    "input": {
+        **get_base_input(),
+        "content": "【报价】24 附息国债 15，代码 240015.IB，收益率 2.35%，量 2 亿，ofr，T+1",
+        "toGroupName": "机构交易聊天室",
+        "toQQGroup": "123456789"
+    },
+    "config": {
+        "output_schema": "v1_standard"
+    }
+}
+
+# 测试用例 4: 带 request_id 的链路追踪
+TEST_CASE_4 = {
+    "name": "带链路追踪 ID",
+    "input": {
+        **get_base_input(),
+        "content": "平盘过 23 国开 05，收益率 2.55%，1 亿"
+    },
+    "request_id": f"trace_{int(time.time())}_abc123",
+    "config": {}
+}
+
+# 测试用例 5: 最小化配置（只填必填字段）
+TEST_CASE_5 = {
+    "name": "最小化输入",
+    "input": {
+        "timestamp": "2026/02/10 14:30:00",
+        "content": "询价 24 农发 01",
+        "fromCorpName": "测试证券",
+        "fromName": "测试员",
+        "fromQQ": "111111111",
+        "msgUniqueID": "msg_min_001",
+        "toCorpName": "测试基金",
+        "toName": "交易员",
+        "toQQ": "222222222"
+    },
+    "config": {}
+}
+
+# ==================== 测试函数 ====================
+
+def print_separator(title: str):
+    """打印分隔线"""
+    print("\n" + "=" * 80)
+    print(f"  {title}")
+    print("=" * 80)
+
+def print_json(title: str, data: dict, max_length: int = 500):
+    """格式化打印 JSON"""
+    print(f"\n【{title}】")
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(json_str) > max_length:
+        print(json_str[:max_length] + "... (内容过长，已截断)")
+    else:
+        print(json_str)
+
+def run_test(test_case: dict, base_url: str = BASE_URL) -> dict:
+    """
+    执行单个测试用例
+    
+    Args:
+        test_case: 测试用例字典
+        base_url: 服务地址
+    
+    Returns:
+        响应结果字典
+    """
+    url = f"{base_url}{API_ENDPOINT}"
+    
+    print_separator(f"测试：{test_case['name']}")
+    
+    # 打印请求信息
+    print_json("请求参数", test_case)
+    
+    start_time = time.time()
+    
+    try:
+        # 发送请求
+        response = httpx.post(
+            url,
+            json=test_case,
+            headers={"Content-Type": "application/json"},
+            timeout=TIMEOUT
+        )
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        # 打印响应信息
+        print(f"\nHTTP 状态码：{response.status_code}")
+        print(f"请求耗时：{elapsed_ms} ms")
+        
+        if response.status_code == 200:
+            result = response.json()
+            print_json("响应结果", result)
+            
+            # 验证响应结构
+            validate_response(result)
+            
+            return {"success": True, "data": result, "elapsed_ms": elapsed_ms}
+        else:
+            print(f"❌ 请求失败：{response.text}")
+            return {"success": False, "error": response.text, "elapsed_ms": elapsed_ms}
+            
+    except httpx.ConnectError as e:
+        print(f"❌ 连接错误：{str(e)}")
+        print(f"💡 请确认服务已启动：{base_url}")
+        return {"success": False, "error": str(e), "elapsed_ms": 0}
+    except httpx.TimeoutException as e:
+        print(f"❌ 请求超时：{str(e)}")
+        return {"success": False, "error": str(e), "elapsed_ms": TIMEOUT * 1000}
+    except Exception as e:
+        print(f"❌ 未知错误：{str(e)}")
+        return {"success": False, "error": str(e), "elapsed_ms": 0}
+
+def validate_response(response: dict):
+    """验证响应结构是否符合规范"""
+    print("\n【响应结构验证】")
+    
+    required_fields = ["code", "message", "data"]
+    for field in required_fields:
+        if field in response:
+            print(f"  ✅ {field}: 存在")
+        else:
+            print(f"  ❌ {field}: 缺失")
+    
+    if "data" in response and response["data"]:
+        data = response["data"]
+        data_fields = ["task_id", "entities", "meta"]
+        for field in data_fields:
+            if field in data:
+                print(f"  ✅ data.{field}: 存在")
+            else:
+                print(f"  ❌ data.{field}: 缺失")
+        
+        if "meta" in data:
+            meta = data["meta"]
+            meta_fields = ["model", "tokens_used", "latency_ms", "output_schema"]
+            for field in meta_fields:
+                if field in meta:
+                    print(f"  ✅ meta.{field}: {meta[field]}")
+                else:
+                    print(f"  ⚠️  meta.{field}: 缺失")
+
+def run_all_tests(base_url: str = BASE_URL):
+    """运行所有测试用例"""
+    test_cases = [
+        TEST_CASE_1,
+        TEST_CASE_2,
+        TEST_CASE_3,
+        TEST_CASE_4,
+        TEST_CASE_5
+    ]
+    
+    results = []
+    success_count = 0
+    
+    print_separator("🚀 债券交易 LLM 抽取服务 - 批量测试")
+    print(f"服务地址：{base_url}{API_ENDPOINT}")
+    print(f"测试用例数：{len(test_cases)}")
+    print(f"开始时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    for i, test_case in enumerate(test_cases, 1):
+        print(f"\n>>> 执行测试 {i}/{len(test_cases)}")
+        result = run_test(test_case, base_url)
+        results.append(result)
+        
+        if result["success"]:
+            success_count += 1
+        
+        # 每个测试之间间隔 1 秒
+        if i < len(test_cases):
+            time.sleep(1)
+    
+    # 打印测试总结
+    print_separator("📊 测试总结")
+    print(f"总用例数：{len(test_cases)}")
+    print(f"成功数：{success_count}")
+    print(f"失败数：{len(test_cases) - success_count}")
+    print(f"成功率：{success_count / len(test_cases) * 100:.1f}%")
+    
+    total_elapsed = sum(r.get("elapsed_ms", 0) for r in results)
+    print(f"总耗时：{total_elapsed} ms")
+    print(f"平均耗时：{total_elapsed / len(test_cases):.0f} ms")
+    print(f"结束时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    return results
+
+# ==================== 快速测试函数 ====================
+
+def quick_test(content: str, base_url: str = BASE_URL):
+    """
+    快速测试单个消息
+    
+    Args:
+        content: 聊天内容
+        base_url: 服务地址
+    """
+    test_case = {
+        "input": {
+            **get_base_input(),
+            "content": content
+        },
+        "config": {}
+    }
+    return run_test(test_case, base_url)
+
+# ==================== 主函数 ====================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="债券交易 LLM 抽取服务测试脚本")
+    parser.add_argument(
+        "--url", 
+        type=str, 
+        default=BASE_URL, 
+        help=f"服务地址 (默认：{BASE_URL})"
+    )
+    parser.add_argument(
+        "--quick", 
+        type=str, 
+        default=None, 
+        help="快速测试指定内容"
+    )
+    parser.add_argument(
+        "--case", 
+        type=int, 
+        default=None, 
+        help="运行指定测试用例 (1-5)"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.quick:
+        # 快速测试模式
+        quick_test(args.quick, args.url)
+    elif args.case:
+        # 单用例测试模式
+        test_cases = [
+            TEST_CASE_1, TEST_CASE_2, TEST_CASE_3, 
+            TEST_CASE_4, TEST_CASE_5
+        ]
+        if 1 <= args.case <= len(test_cases):
+            run_test(test_cases[args.case - 1], args.url)
+        else:
+            print(f"❌ 无效的用例编号：{args.case} (1-{len(test_cases)})")
+    else:
+        # 批量测试模式
+        run_all_tests(args.url)
+```
+
+### `tests/requirements-test.txt`
+
+```text
+httpx>=0.26.0
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+```
+
+### 使用方式
+
+```bash
+# 1. 安装测试依赖
+pip install -r tests/requirements-test.txt
+
+# 2. 运行所有测试用例
+python tests/test_api.py
+
+# 3. 指定服务地址测试
+python tests/test_api.py --url http://192.168.1.100:8000
+
+# 4. 快速测试单条消息
+python tests/test_api.py --quick "出 24 国债 01，净价 99.5，量 1000 万"
+
+# 5. 运行指定测试用例
+python tests/test_api.py --case 1
+python tests/test_api.py --case 3
+```
+
+### 预期输出示例
+
+```
+================================================================================
+  🚀 债券交易 LLM 抽取服务 - 批量测试
+================================================================================
+服务地址：http://localhost:8000/api/v1/llm/extract-transaction
+测试用例数：5
+开始时间：2026-02-10 15:30:00
+
+>>> 执行测试 1/5
+
+================================================================================
+  测试：标准债券交易 - 使用默认 schema
+================================================================================
+
+【请求参数】
+{
+  "input": {
+    "timestamp": "2026/02/10 10:26:06",
+    "content": "出 24 国债 01，净价 99.5，量 1000 万，T+0 清算，有意向的私",
+    ...
+  },
+  "config": {}
+}
+
+HTTP 状态码：200
+请求耗时：1523 ms
+
+【响应结果】
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "task_id": "550e8400-e29b-41d4-a716-446655440000",
+    "entities": [
+      {
+        "timestamp": "2026/02/10 10:26:06",
+        "stock_code": "240001.IB",
+        "stock_name": "24 国债 01",
+        "price_type": "净价",
+        "cust_trade_price": "99.5",
+        "cust_trade_amount": "1000W",
+        "clear_speed": "T+0",
+        ...
+      }
+    ],
+    "meta": {
+      "model": "qwen-max",
+      "tokens_used": 256,
+      "latency_ms": 1450,
+      "output_schema": "v1_standard"
+    }
+  }
+}
+
+【响应结构验证】
+  ✅ code: 存在
+  ✅ message: 存在
+  ✅ data: 存在
+  ✅ data.task_id: 存在
+  ✅ data.entities: 存在
+  ✅ data.meta: 存在
+  ✅ meta.model: qwen-max
+  ✅ meta.tokens_used: 256
+  ✅ meta.latency_ms: 1450
+  ✅ meta.output_schema: v1_standard
+
+... (其他测试用例)
+
+================================================================================
+  📊 测试总结
+================================================================================
+总用例数：5
+成功数：5
+失败数：0
+成功率：100.0%
+总耗时：7845 ms
+平均耗时：1569 ms
+结束时间：2026-02-10 15:30:08
+```
+
+### Docker 测试（服务在容器中）
+
+```bash
+# 1. 启动服务
+docker run -d -p 8000:8000 --env-file .env bond-llm-extractor:latest
+
+# 2. 等待服务启动
+sleep 5
+
+# 3. 运行测试
+python tests/test_api.py --url http://localhost:8000
+
+# 4. 停止服务
+docker stop $(docker ps -q --filter ancestor=bond-llm-extractor)
+```
+
+这个测试脚本提供了完整的测试覆盖，包括参数验证、响应结构检查、性能统计等功能！
+
