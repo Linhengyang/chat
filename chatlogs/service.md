@@ -450,3 +450,820 @@ DEFAULT_MODEL_VERSION=qwen-max
 4.  **监控元数据**: `meta` 字段中记录了 `tokens_used` 和 `latency_ms`，这对于后续的成本核算和性能监控至关重要。
 5.  **容错**: 增加了 `try-except` 块捕获 LLM 调用异常，并记录日志，防止服务因单次 LLM 超时导致崩溃。
 
+
+---
+🙋**user**:
+---
+```
+你在LLMClient中payload.messages中给role system写了{"role": "system", "content": "You are a helpful assistant for bond trading entity extraction."},同时又在prompt_builder中写了system_instruction加在了{"role": "user", "content": prompt}的prompt里。这是怎么回事？为什么在不同地方写了两条system prompt
+```
+
+---
+🤖**assistant**:
+---
+
+你说得非常对！这是一个**设计上的不一致**，是我的疏忽。让我解释一下原因并给出修正方案。
+
+## 问题分析
+
+| 位置 | 内容 | Role | 问题 |
+|------|------|------|------|
+| `llm_client.py` | "You are a helpful assistant..." | `system` | 通用系统指令 |
+| `prompt_builder.py` | "你是一个债券交易助手..." | `user` (嵌入在 prompt 中) | 业务系统指令 |
+
+**这会导致：**
+1. **指令冲突**：两条 system 指令可能互相干扰
+2. **优先级混乱**：不同模型对多条 system 指令的处理方式不同
+3. **维护困难**：系统指令分散在两个地方
+
+## 修正方案
+
+### 方案一：统一使用 `system` role（推荐）
+
+将完整的系统指令放在 `messages` 的 `system` 字段中，`prompt_builder` 只负责构建用户输入内容。
+
+#### 修正后的 `prompt_builder.py`
+```python
+from app.models import ExtractionRequest
+
+def build_system_prompt(schema_version: str) -> str:
+    """
+    构建系统指令 - 只放在 system role 中
+    """
+    return f"""
+你是一个债券交易助手。请从聊天信息中提取交易实体。
+请严格按照 {schema_version} 模板输出 JSON 格式，不要包含任何 Markdown 标记。
+如果某些字段无法从聊天内容中识别，请返回 null 或空字符串。
+确保输出是有效的 JSON，可以直接被解析。
+"""
+
+def build_user_prompt(request: ExtractionRequest) -> str:
+    """
+    构建用户输入内容 - 只包含业务数据
+    """
+    input_data = request.input
+    
+    context = f"""
+消息时间：{input_data.timestamp}
+发送人：{input_data.fromName} ({input_data.fromCorpName}) - QQ:{input_data.fromQQ}
+接收人：{input_data.toName} ({input_data.toCorpName}) - QQ:{input_data.toQQ}
+聊天内容：
+{input_data.content}
+"""
+    return context
+
+def build_messages(request: ExtractionRequest) -> list:
+    """
+    构建完整的 messages 列表
+    """
+    schema_version = request.config.output_schema if request.config else "v1_standard"
+    
+    return [
+        {"role": "system", "content": build_system_prompt(schema_version)},
+        {"role": "user", "content": build_user_prompt(request)}
+    ]
+```
+
+#### 修正后的 `llm_client.py`
+```python
+async def extract_entities(self, messages: list, config: LLMConfig) -> dict:
+    """
+    调用 LLM 服务进行实体抽取。
+    参数 messages 已经包含 system 和 user 角色
+    """
+    start_time = time.time()
+    
+    payload = {
+        "model": config.model_version or settings.DEFAULT_MODEL_VERSION,
+        "messages": messages,  # 直接使用构建好的 messages
+        "temperature": config.temperature if config.temperature is not None else 0.1,
+        "response_format": {"type": "json_object"}
+    }
+    
+    # ... 其余代码不变
+```
+
+#### 修正后的 `main.py`
+```python
+@app.post("/api/v1/llm/extract-transaction", response_model=ApiResponse)
+async def extract_transaction(request: ExtractionRequest):
+    task_id = str(uuid.uuid4())
+    logger.info(f"Task {task_id} started. RequestID: {request.request_id}")
+    
+    try:
+        # 1. 构建完整的 messages (包含 system 和 user)
+        from app.services.prompt_builder import build_messages
+        messages = build_messages(request)
+        
+        # 2. 调用 LLM 服务
+        llm_result = await llm_client.extract_entities(messages, request.config or LLMConfig())
+        
+        # ... 其余代码不变
+```
+
+### 方案二：为什么有时会看到两种方式混用？
+
+| 场景 | 原因 | 建议 |
+|------|------|------|
+| 旧版 API 不支持 system role | 如早期 GPT-3 API | 把 system 指令放在 user prompt 开头 |
+| 某些模型忽略 system role | 部分开源模型 | 需要测试具体模型行为 |
+| 动态切换系统指令 | 需要运行时调整 | 放在 user prompt 更灵活 |
+
+### 架构对比图
+
+```
+❌ 错误设计（当前代码）
+┌─────────────────────────────────────────┐
+│  llm_client.py                          │
+│  messages = [{"role": "system", ...}]   │  ← system 指令 1
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│  prompt_builder.py                      │
+│  prompt = "system_instruction + data"   │  ← system 指令 2 (在 user 里)
+└─────────────────────────────────────────┘
+
+✅ 正确设计（修正后）
+┌─────────────────────────────────────────┐
+│  prompt_builder.py                      │
+│  build_messages()                       │
+│    ├─ {"role": "system", ...}          │  ← 唯一的 system 指令
+│    └─ {"role": "user", ...}            │  ← 只有业务数据
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│  llm_client.py                          │
+│  直接使用 messages，不再修改            │
+└─────────────────────────────────────────┘
+```
+
+## 总结
+
+| 原则 | 说明 |
+|------|------|
+| **单一职责** | `prompt_builder` 负责构建完整消息，`llm_client` 负责发送请求 |
+| **统一管理** | 所有 system 指令集中在一个地方维护 |
+| **符合规范** | 遵循 OpenAI 等多数 LLM API 的标准格式 |
+
+感谢你的细心发现！这确实是代码审查中应该抓住的典型问题。修正后的代码会更清晰、更易维护。
+
+
+---
+🙋**user**:
+---
+```
+问题1: 你在app/config.py中写的Settings, 又写了LLM_API_URL/LLM_API_KEY等，然后又写了Config: env_file='.env'。那我到底是在哪里配置API_URL和API_KEY呢？然后你Settings内部的DEFAULT_OUTPUT_SCHEMA也没用上啊
+问题2: 实际上我没看到默认模板v1_standard的具体配置，你反而是根据v1_standard写死了EntityData。但我的本意是v1_standard只是output_schema未提供时的模板而已，EntityData的结构应该与output_schema相同，也就是output_schema未提供时，EntityData才应该与v1_standard相同。我觉得这里有点问题
+```
+
+---
+🤖**assistant**:
+---
+
+你提的两个问题非常关键！让我逐一修正。
+
+## 问题 1: 配置优先级与实际使用
+
+### 配置优先级说明
+
+```
+环境变量 (OS) > .env 文件 > 代码默认值
+```
+
+**正确配置方式**：
+
+| 位置 | 用途 | 示例 |
+|------|------|------|
+| `app/config.py` | 定义配置项 + 默认值 | 开发/测试默认值 |
+| `.env` 文件 | 生产环境实际配置 | Docker 部署时使用 |
+| 系统环境变量 | 最高优先级 | K8s/云平台注入 |
+
+### 修正后的 `app/config.py`
+
+```python
+import os
+from pydantic_settings import BaseSettings
+from typing import Dict, List
+
+class Settings(BaseSettings):
+    # ==================== 服务配置 ====================
+    APP_NAME: str = "Bond LLM Extraction Service"
+    DEBUG: bool = False
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    
+    # ==================== LLM 服务配置 ====================
+    LLM_API_URL: str = "http://llm-internal-service:8080/v1/chat/completions"
+    LLM_API_KEY: str = "sk-default-key-change-me"
+    LLM_TIMEOUT: int = 30
+    
+    # ==================== 默认推理配置 ====================
+    DEFAULT_MODEL_VERSION: str = "qwen-max"
+    DEFAULT_TEMPERATURE: float = 0.1
+    DEFAULT_OUTPUT_SCHEMA: str = "v1_standard"  # ✅ 这里定义，下面会使用
+    
+    # ==================== Schema 模板配置 ====================
+    # 定义不同 output_schema 版本对应的字段说明（用于 Prompt 构建）
+    OUTPUT_SCHEMA_TEMPLATES: Dict[str, List[str]] = {
+        "v1_standard": [
+            "timestamp", "quote_type", "intent", "sales_qq", "sales_name",
+            "cust_org_name", "cust_qq_group", "cust_group_open_id", "cust_group_name",
+            "cust_qq", "cust_name", "price_type", "cust_trade_price",
+            "cust_trade_amount", "cust_trade_direction", "stock_code",
+            "stock_name", "clear_speed", "trader_name", "remark", "initiator"
+        ],
+        # 未来可扩展 v2_enhanced 等版本
+    }
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False  # 环境变量不区分大小写
+
+settings = Settings()
+
+# ✅ 验证 DEFAULT_OUTPUT_SCHEMA 是否在模板中
+if settings.DEFAULT_OUTPUT_SCHEMA not in settings.OUTPUT_SCHEMA_TEMPLATES:
+    raise ValueError(
+        f"DEFAULT_OUTPUT_SCHEMA '{settings.DEFAULT_OUTPUT_SCHEMA}' not found in templates. "
+        f"Available: {list(settings.OUTPUT_SCHEMA_TEMPLATES.keys())}"
+    )
+```
+
+### 修正后的 `.env` 文件（生产环境配置）
+
+```bash
+# .env
+APP_NAME=Bond LLM Extraction Service
+DEBUG=false
+
+# LLM 服务配置（Docker 网络中使用服务名）
+LLM_API_URL=http://llm-service:8080/v1/chat/completions
+LLM_API_KEY=sk-prod-secret-key-xxxxx
+LLM_TIMEOUT=60
+
+# 默认推理配置
+DEFAULT_MODEL_VERSION=qwen-max
+DEFAULT_TEMPERATURE=0.1
+DEFAULT_OUTPUT_SCHEMA=v1_standard
+```
+
+### 使用示例
+
+```python
+from app.config import settings
+
+# 代码中直接使用（会自动从 .env 或环境变量读取）
+print(settings.LLM_API_URL)           # 从 .env 读取
+print(settings.DEFAULT_OUTPUT_SCHEMA) # 从 .env 读取，默认 "v1_standard"
+print(settings.OUTPUT_SCHEMA_TEMPLATES["v1_standard"]) # 获取字段列表
+```
+
+---
+
+## 问题 2: EntityData 动态适配 output_schema
+
+你的理解完全正确！`EntityData` 不应该写死为 `v1_standard`，而应该根据 `config.output_schema` 动态适配。
+
+### 修正方案：使用 `Dict[str, Any]` + Schema 元数据
+
+#### 修正后的 `app/models.py`
+
+```python
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import uuid
+
+# ==================== 请求模型 ====================
+
+class InputMessage(BaseModel):
+    timestamp: str = Field(..., description="标准化时间 yyyy/MM/DD HH:mm:ss")
+    content: str = Field(..., description="聊天内容")
+    fromCorpName: str = Field(..., description="发送方机构")
+    fromName: str = Field(..., description="发送方姓名")
+    fromOpenID: Optional[str] = Field(None, description="发送方 OpenID")
+    fromQQ: str = Field(..., description="发送方 QQ")
+    msgUniqueID: str = Field(..., description="消息唯一 ID")
+    toCorpName: str = Field(..., description="接收方机构")
+    toGroupName: Optional[str] = Field(None, description="接收群名")
+    toGroupOpenID: Optional[str] = Field(None, description="接收群 OpenID")
+    toName: str = Field(..., description="接收方姓名")
+    toOpenID: Optional[str] = Field(None, description="接收方 OpenID")
+    toQQ: str = Field(..., description="接收方 QQ")
+    toQQGroup: Optional[str] = Field(None, description="接收方 QQ 群号")
+
+class LLMConfig(BaseModel):
+    model_version: Optional[str] = Field(None, description="模型版本")
+    temperature: Optional[float] = Field(None, ge=0, le=1, description="采样温度")
+    output_schema: Optional[str] = Field(None, description="输出模板版本")
+    
+    def get_effective_schema(self, default_schema: str) -> str:
+        """获取实际生效的 output_schema"""
+        return self.output_schema if self.output_schema else default_schema
+
+class ExtractionRequest(BaseModel):
+    input: InputMessage
+    request_id: Optional[str] = Field(None, description="链路追踪 ID")
+    config: Optional[LLMConfig] = Field(default_factory=LLMConfig)
+
+# ==================== 响应模型 ====================
+
+class EntityData(BaseModel):
+    """
+    动态实体数据 - 使用 Dict 适配不同 output_schema 版本
+    具体字段由 config.output_schema 决定
+    """
+    class Config:
+        extra = "allow"  # ✅ 允许额外字段，适配不同 schema 版本
+
+class MetaData(BaseModel):
+    model: str
+    tokens_used: int
+    latency_ms: int
+    output_schema: str  # ✅ 记录实际使用的 schema 版本
+
+class ResponseData(BaseModel):
+    task_id: str
+    entities: List[Dict[str, Any]]  # ✅ 使用 Dict 保持灵活性
+    meta: MetaData
+
+class ApiResponse(BaseModel):
+    code: int = 200
+    message: str = "success"
+    data: Optional[ResponseData] = None
+```
+
+#### 修正后的 `app/services/prompt_builder.py`
+
+```python
+from app.models import ExtractionRequest
+from app.config import settings
+
+def build_system_prompt(schema_version: str) -> str:
+    """
+    根据 output_schema 版本构建系统指令
+    """
+    # 获取该 schema 版本的字段列表
+    schema_fields = settings.OUTPUT_SCHEMA_TEMPLATES.get(
+        schema_version, 
+        settings.OUTPUT_SCHEMA_TEMPLATES[settings.DEFAULT_OUTPUT_SCHEMA]
+    )
+    
+    fields_str = ", ".join(schema_fields)
+    
+    return f"""
+你是一个债券交易助手。请从聊天信息中提取交易实体。
+
+输出要求：
+1. 严格按照 {schema_version} 模板输出 JSON 格式
+2. 需要包含的字段：{fields_str}
+3. 不要包含任何 Markdown 标记（如 ```json）
+4. 如果某些字段无法从聊天内容中识别，请返回 null 或空字符串
+5. 确保输出是有效的 JSON，可以直接被解析
+
+{schema_version} 模板示例：
+{{
+    "timestamp": "2026/02/10 10:26:06",
+    "quote_type": "群聊",
+    "intent": "",
+    "sales_qq": "0123456789",
+    "sales_name": "赵钱",
+    "cust_org_name": "xx 证券",
+    ...
+}}
+"""
+
+def build_user_prompt(request: ExtractionRequest) -> str:
+    """
+    构建用户输入内容 - 只包含业务数据
+    """
+    input_data = request.input
+    
+    context = f"""
+消息时间：{input_data.timestamp}
+发送人：{input_data.fromName} ({input_data.fromCorpName}) - QQ:{input_data.fromQQ}
+接收人：{input_data.toName} ({input_data.toCorpName}) - QQ:{input_data.toQQ}
+聊天内容：
+{input_data.content}
+"""
+    return context
+
+def build_messages(request: ExtractionRequest) -> list:
+    """
+    构建完整的 messages 列表（包含 system 和 user）
+    """
+    # ✅ 使用配置中的默认值
+    effective_schema = request.config.get_effective_schema(
+        settings.DEFAULT_OUTPUT_SCHEMA
+    )
+    
+    return [
+        {"role": "system", "content": build_system_prompt(effective_schema)},
+        {"role": "user", "content": build_user_prompt(request)}
+    ]
+```
+
+#### 修正后的 `app/main.py`
+
+```python
+import uuid
+import logging
+from fastapi import FastAPI, HTTPException
+from app.config import settings
+from app.models import (
+    ExtractionRequest, ApiResponse, ResponseData, MetaData, LLMConfig
+)
+from app.services.prompt_builder import build_messages
+from app.services.llm_client import llm_client
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title=settings.APP_NAME)
+
+@app.post("/api/v1/llm/extract-transaction", response_model=ApiResponse)
+async def extract_transaction(request: ExtractionRequest):
+    task_id = str(uuid.uuid4())
+    logger.info(f"Task {task_id} started. RequestID: {request.request_id}")
+    
+    try:
+        # ✅ 获取实际生效的 output_schema
+        effective_schema = request.config.get_effective_schema(
+            settings.DEFAULT_OUTPUT_SCHEMA
+        ) if request.config else settings.DEFAULT_OUTPUT_SCHEMA
+        
+        logger.info(f"Using output_schema: {effective_schema}")
+        
+        # 1. 构建完整的 messages (包含 system 和 user)
+        messages = build_messages(request)
+        
+        # 2. 调用 LLM 服务
+        llm_result = await llm_client.extract_entities(
+            messages, 
+            request.config or LLMConfig(),
+            effective_schema  # ✅ 传入 schema 版本用于元数据
+        )
+        
+        # 3. 封装响应
+        response_data = ResponseData(
+            task_id=task_id,
+            entities=llm_result["entities"],
+            meta=MetaData(
+                model=llm_result["meta"]["model"],
+                tokens_used=llm_result["meta"]["tokens_used"],
+                latency_ms=llm_result["meta"]["latency_ms"],
+                output_schema=effective_schema  # ✅ 记录使用的 schema 版本
+            )
+        )
+        
+        logger.info(f"Task {task_id} completed successfully.")
+        
+        return ApiResponse(
+            code=200,
+            message="success",
+            data=response_data
+        )
+        
+    except Exception as e:
+        logger.error(f"Task {task_id} failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+#### 修正后的 `app/services/llm_client.py`
+
+```python
+import httpx
+import time
+import json
+from app.config import settings
+from app.models import LLMConfig
+
+class LLMClient:
+    def __init__(self):
+        self.base_url = settings.LLM_API_URL
+        self.api_key = settings.LLM_API_KEY
+        self.timeout = settings.LLM_TIMEOUT
+
+    async def extract_entities(
+        self, 
+        messages: list, 
+        config: LLMConfig,
+        output_schema: str  # ✅ 新增参数
+    ) -> dict:
+        """
+        调用 LLM 服务进行实体抽取
+        """
+        start_time = time.time()
+        
+        payload = {
+            "model": config.model_version or settings.DEFAULT_MODEL_VERSION,
+            "messages": messages,
+            "temperature": config.temperature if config.temperature is not None else settings.DEFAULT_TEMPERATURE,
+            "response_format": {"type": "json_object"}
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    self.base_url, 
+                    json=payload, 
+                    headers=headers, 
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+                resp_json = response.json()
+                
+                content = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                usage = resp_json.get("usage", {})
+                model_used = resp_json.get("model", "unknown")
+                
+                entities = json.loads(content)
+                
+                end_time = time.time()
+                latency_ms = int((end_time - start_time) * 1000)
+                
+                return {
+                    "entities": entities if isinstance(entities, list) else [entities],
+                    "meta": {
+                        "model": model_used,
+                        "tokens_used": usage.get("total_tokens", 0),
+                        "latency_ms": latency_ms,
+                        "output_schema": output_schema  # ✅ 传递 schema 版本
+                    }
+                }
+                
+            except httpx.HTTPError as e:
+                raise Exception(f"LLM Service Error: {str(e)}")
+            except json.JSONDecodeError as e:
+                raise Exception(f"LLM Response Parse Error: {str(e)}")
+
+llm_client = LLMClient()
+```
+
+---
+
+## 修正后的架构对比
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  app/config.py                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ OUTPUT_SCHEMA_TEMPLATES = {                         │   │
+│  │     "v1_standard": [fields...],                     │   │
+│  │     "v2_enhanced": [fields...]  ← 可扩展            │   │
+│  │ }                                                   │   │
+│  │ DEFAULT_OUTPUT_SCHEMA = "v1_standard"               │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  app/main.py                                                │
+│  effective_schema = config.output_schema or DEFAULT         │
+│  ↓ 传递给 prompt_builder 和 llm_client                      │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  app/services/prompt_builder.py                             │
+│  system_prompt = 根据 effective_schema 动态生成             │
+│  (包含对应版本的字段列表和示例)                             │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│  app/models.py                                              │
+│  EntityData: extra="allow"  ← 允许任意字段                  │
+│  MetaData.output_schema: 记录实际使用的版本                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 使用示例
+
+### 场景 1: 不指定 output_schema（使用默认）
+
+```json
+{
+  "input": { ... },
+  "config": {}
+}
+```
+→ 使用 `v1_standard`，响应中 `meta.output_schema: "v1_standard"`
+
+### 场景 2: 指定 output_schema
+
+```json
+{
+  "input": { ... },
+  "config": {
+    "output_schema": "v2_enhanced"
+  }
+}
+```
+→ 使用 `v2_enhanced`，响应中 `meta.output_schema: "v2_enhanced"`
+
+### 场景 3: 扩展新 schema 版本
+
+```python
+# app/config.py
+OUTPUT_SCHEMA_TEMPLATES = {
+    "v1_standard": [...],
+    "v2_enhanced": [...],
+    "v3_minimal": [...]  # 新增版本
+}
+```
+
+无需修改其他代码，自动生效！
+
+---
+
+## 总结
+
+| 问题 | 修正方案 |
+|------|----------|
+| 配置位置不清晰 | 明确优先级：环境变量 > .env > 代码默认值 |
+| DEFAULT_OUTPUT_SCHEMA 未使用 | 在 `main.py` 和 `prompt_builder` 中实际使用 |
+| EntityData 写死 | 使用 `Dict[str, Any]` + `extra="allow"` 动态适配 |
+| Schema 版本不可扩展 | 在 `config.py` 中集中管理模板，支持新增版本 |
+| 响应中无 schema 信息 | `MetaData` 增加 `output_schema` 字段 |
+
+这样修改后，配置更清晰，架构更灵活，支持多版本 schema 扩展！
+
+
+---
+🙋**user**:
+---
+```
+我可能懂app/config.py里的Settings和.env的关系了: BaseSettings基本类保证, 当没有.env文件时, 起作用的是Settings类变量LLM_API_URL等, 但是当有.env文件时，.env文件内配置的变量会覆盖掉Settings类的类变量。我理解地对吗？
+```
+
+---
+🤖**assistant**:
+---
+
+你的理解**基本正确**，但有几个关键细节需要澄清，这样你在实际使用中会更有把握。
+
+## 核心机制：优先级链条
+
+```
+系统环境变量 (最高)  >  .env 文件  >  代码默认值 (最低)
+```
+
+### 准确的理解
+
+| 场景 | 行为 | 示例 |
+|------|------|------|
+| **没有 .env 文件** | 使用 Settings 类中定义的**默认值** | `LLM_API_URL = "http://default:8080"` |
+| **有 .env 文件** | .env 中的值**优先于**代码默认值 | `.env` 中 `LLM_API_URL=http://prod:8080` 会生效 |
+| **有系统环境变量** | 系统环境变量**优先于** .env 文件 | `export LLM_API_URL=http://env:8080` 会生效 |
+
+### 关键澄清点
+
+**❌ 不准确的说法**：".env 文件覆盖掉 Settings 类的类变量"
+
+**✅ 准确的说法**：`BaseSettings` 在**实例化时**按照优先级读取配置，然后赋值给**实例属性**。类变量本身是**默认值**，不会被修改。
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    LLM_API_URL: str = "http://default:8080"  # 这是默认值
+    class Config:
+        env_file = ".env"
+
+settings = Settings()  # 实例化时读取配置
+```
+
+```python
+# 验证类变量 vs 实例属性
+from app.config import Settings, settings
+
+print(Settings.LLM_API_URL)   # 永远是 "http://default:8080" (类默认值)
+print(settings.LLM_API_URL)   # 根据 .env 或环境变量动态决定 (实例值)
+```
+
+## 实际验证示例
+
+### 测试 1: 没有 .env 文件
+
+```bash
+# 删除 .env 文件
+rm .env
+
+# 运行 Python
+python -c "from app.config import settings; print(settings.LLM_API_URL)"
+# 输出：http://default:8080  ← 使用代码默认值
+```
+
+### 测试 2: 有 .env 文件
+
+```bash
+# 创建 .env 文件
+echo "LLM_API_URL=http://from-env-file:8080" > .env
+
+# 运行 Python
+python -c "from app.config import settings; print(settings.LLM_API_URL)"
+# 输出：http://from-env-file:8080  ← .env 文件生效
+```
+
+### 测试 3: 系统环境变量优先级最高
+
+```bash
+# 同时有 .env 和系统环境变量
+echo "LLM_API_URL=http://from-env-file:8080" > .env
+export LLM_API_URL=http://from-system-env:8080
+
+# 运行 Python
+python -c "from app.config import settings; print(settings.LLM_API_URL)"
+# 输出：http://from-system-env:8080  ← 系统环境变量优先级最高
+```
+
+## 优先级验证表
+
+| 配置来源 | 设置方式 | 优先级 | 使用场景 |
+|----------|----------|--------|----------|
+| 系统环境变量 | `export LLM_API_URL=xxx` 或 K8s ConfigMap | ⭐⭐⭐ 最高 | 生产环境、CI/CD、云平台 |
+| .env 文件 | `LLM_API_URL=xxx` 在项目中 | ⭐⭐ 中等 | 本地开发、Docker 本地测试 |
+| 代码默认值 | `LLM_API_URL: str = "default"` | ⭐ 最低 | 兜底值、开发便利 |
+
+## Docker 部署时的典型配置
+
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+# .env 文件通常不打包进镜像（通过 .dockerignore 排除）
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  bond-llm-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:  # ✅ 方式 1: 直接在 compose 中设置环境变量（优先级最高）
+      - LLM_API_URL=http://llm-service:8080
+      - LLM_API_KEY=sk-secret-key
+    # env_file:  # ✅ 方式 2: 使用 .env 文件
+    #   - .env
+```
+
+## 最佳实践建议
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  开发环境                                                   │
+│  ├── .env 文件（本地配置，不提交到 git）                    │
+│  └── .env.example（模板，提交到 git）                       │
+├─────────────────────────────────────────────────────────────┤
+│  测试/生产环境                                              │
+│  ├── K8s ConfigMap / Secrets                                │
+│  ├── 云平台环境变量（AWS Secrets Manager 等）               │
+│  └── CI/CD 流水线注入                                       │
+├─────────────────────────────────────────────────────────────┤
+│  代码默认值                                                 │
+│  └── 仅作为兜底，确保服务能启动                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# .env.example（提交到 git）
+LLM_API_URL=http://localhost:8080
+LLM_API_KEY=change-me
+DEFAULT_MODEL_VERSION=qwen-max
+
+# .env（本地开发，不提交到 git）
+LLM_API_URL=http://dev-llm:8080
+LLM_API_KEY=sk-dev-secret-key
+DEFAULT_MODEL_VERSION=qwen-max
+```
+
+```gitignore
+# .gitignore
+.env
+.env.local
+*.pyc
+__pycache__/
+```
+
+## 总结
+
+你的理解 **90% 正确**！只需要记住：
+
+1. **不是"覆盖类变量"**，而是**实例化时按优先级读取**
+2. **系统环境变量 > .env 文件 > 代码默认值**
+3. **类变量是默认值，实例属性是实际值**
+
+这样在不同环境（本地开发、Docker、K8s、云平台）部署时，你就知道该在哪里配置了！
+
