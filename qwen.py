@@ -2,11 +2,12 @@ import os
 from openai import OpenAI
 import json
 from render import render_json
+from dotenv import load_dotenv
 
 # 模型列表: https://help.aliyun.com/model-studio/getting-started/models
 
-
-
+# 加载 .env 环境变量
+load_dotenv()
 
 def ask_qwen(chatlogs_json, user_query, render=True):
 
