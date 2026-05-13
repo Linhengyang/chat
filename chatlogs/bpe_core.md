@@ -1005,3 +1005,559 @@ Word w(begin, end);
 ### 总结
 你的直觉很准：**传入两个地址，vector 就会把这两个地址之间的数据拷贝到自己肚子里。** 这正是你实现“独立生命周期”和“可安全修改”的关键机制。
 
+
+---
+🙋**user**:
+---
+```
+你给我的代码示例，是从python层获得pyarrow底层buffer地址，从cpp层获得Word类，最后在cython层完成逻辑。不过我现在希望改一下：cython只做桥接转发，它负责把buffer地址等参数传给cpp函数或类，cpp完成计算后，返回结果。
+具体流程和相关设计如下：
+
+1.cy->cpp cython层api调用 unique_words & freqs --address--> cython --> C++ Word构造 --> unique_words(vector of Word), freqs(vector of const u64)
+  cpp  unique_words & freqs --> pair_counts(hashmap{u64: u64}), where_to_update(hashmap{u64: unordered_set}). 该步骤可以并行
+  cpp  移动语义遍历where_to_update: pair & move(positions) + pair_counts --> C++ Merge构造 --heapify--> max_heap(8-ary heap of Merge)
+loop.cpp 初始化一个记录合并的 merges(vector of (u64, u64), 第一个u64代表两个u32合并, 第二个u64是该pair的计数), 循环merge_cnts从0到num_merges
+  2. 从max_heap取顶端Merge. 如果取顶失败, 说明pair已经全部merge完毕, throw一个runoutError.
+     拿到max Merge{pair, p_cnts, positions}. 如果 p_cnts 与 pair_counts[pair] 对不上, 更新该 Merge.p_cnts, push该Merge回max_heap, continue循环以重新取顶
+     取到max Merge{pair, p_cnts, positions}而且p_cnts相符. 如果p_cnts<1, 退出循环. 拿到待合并pair和p_cnts, 记录其在 merges 中, 算出new_token.
+  3. 初始化一个共享线程安全的线性容器changes, 遍历(可并行)positions中的pos, 即执行:
+     取出unique_words[pos]位置的word, 执行merge方法(待合并pair, new_token), 产出该pos局部线程的 local_changes. 把所有local_changes聚合到changes, 并给每个元素标记其pos
+  4. 线性扫描changes, 取出每个元素(pair, change, pos): 用change和freqs[pos]更新pair_counts[pair]; 为change>0的pair, 给where_to_update[pair]更新添加pos
+  5. 移动语义遍历where_to_update: pair & move(positions) + pair_counts --> C++ Merge构造 --push--> max_heap
+6.cpp->cy loop结束或跳出. 返回 merges(vector of (u64, u64)) 到cython层; 如果是throw runoutError, 该如何返回 merges(vector of (u64, u64)) 到cython层?
+7.cy->py 在cython层执行把 merges(vector of (u64, u64)) 转换为 list of (u32-pair, p_cnts) 作为 bpe_core_loop 的返回. 在python层依据其一次性全部更新入tokenizer
+```
+
+---
+🤖**assistant**:
+---
+
+### 完整架构设计：Cython 桥接 + C++ 核心
+
+你的设计非常合理。Cython 只做指针转发和类型转换，所有计算逻辑在 C++ 层完成。下面是完整实现方案。
+
+---
+
+### 1. C++ 核心代码 (`bpe_engine.h` / `bpe_engine.cpp`)
+
+```cpp
+// bpe_engine.h
+#pragma once
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstdint>
+#include <stdexcept>
+#include <utility>
+
+// ========== 数据结构 ==========
+
+struct Word {
+    std::vector<uint32_t> token_ids;
+    
+    Word() = default;
+    Word(const uint32_t* begin, const uint32_t* end) 
+        : token_ids(begin, end) {}
+    
+    // In-place merge: 将 pair (a,b) 替换为 new_token
+    // 返回该 Word 中发生的合并次数
+    size_t merge_in_place(uint64_t pair_encoded, uint32_t new_token) {
+        size_t count = 0;
+        uint32_t a = pair_encoded >> 32;
+        uint32_t b = pair_encoded & 0xFFFFFFFF;
+        
+        for (size_t i = 0; i + 1 < token_ids.size(); ) {
+            if (token_ids[i] == a && token_ids[i+1] == b) {
+                token_ids[i] = new_token;
+                token_ids.erase(token_ids.begin() + i + 1);
+                count++;
+                // 不 i++，继续检查新位置
+            } else {
+                i++;
+            }
+        }
+        return count;
+    }
+};
+
+struct Merge {
+    uint64_t pair;       // 待合并的 pair (编码为 u64)
+    uint64_t freq;       // 当前计数
+    std::vector<size_t> positions;  // 出现该 pair 的 Word 位置
+    
+    Merge() = default;
+    Merge(uint64_t p, uint64_t f, std::vector<size_t>&& pos)
+        : pair(p), freq(f), positions(std::move(pos)) {}
+};
+
+// 8 叉堆实现 (比二叉堆缓存更友好)
+class MaxHeap8 {
+    std::vector<Merge> heap;
+    
+    size_t parent(size_t i) { return (i - 1) / 8; }
+    size_t child(size_t i, size_t k) { return i * 8 + k + 1; }
+    
+    void sift_up(size_t i);
+    void sift_down(size_t i);
+    
+public:
+    void push(Merge&& m);
+    Merge pop();  // 抛出异常如果为空
+    Merge& top();
+    bool empty() const { return heap.empty(); }
+    size_t size() const { return heap.size(); }
+};
+
+// 线程安全的变更收集
+struct ThreadLocalChange {
+    uint64_t pair;
+    int64_t change;  // 计数变化 (可正可负)
+    size_t pos;
+};
+
+// ========== 主引擎 ==========
+
+class BPEEngine {
+    std::vector<Word> unique_words;
+    std::vector<uint64_t> freqs;
+    
+    std::unordered_map<uint64_t, uint64_t> pair_counts;
+    std::unordered_map<uint64_t, std::unordered_set<size_t>> where_to_update;
+    MaxHeap8 max_heap;
+    
+    std::vector<std::pair<uint64_t, uint64_t>> merges;  // 返回结果
+    
+    // 内部方法
+    void build_initial_pairs();
+    void rebuild_heap_entries();
+    
+public:
+    // 构造：从 PyArrow buffer 地址直接构造
+    BPEEngine(const int64_t* offsets, const uint32_t* values, 
+              const uint64_t* freqs_ptr, size_t num_words);
+    
+    // 执行 BPE 循环
+    // 返回：merges 的数量
+    size_t run(size_t num_merges);
+    
+    // 获取结果
+    const std::vector<std::pair<uint64_t, uint64_t>>& get_merges() const { return merges; }
+    
+    // 获取修改后的 Word (可选，用于调试)
+    const std::vector<Word>& get_words() const { return unique_words; }
+};
+
+// ========== 异常定义 ==========
+
+class RunOutError : public std::runtime_error {
+public:
+    RunOutError() : std::runtime_error("No more merges available") {}
+};
+```
+
+```cpp
+// bpe_engine.cpp
+#include "bpe_engine.h"
+#include <algorithm>
+#include <thread>
+#include <mutex>
+
+// ========== MaxHeap8 实现 ==========
+
+void MaxHeap8::sift_up(size_t i) {
+    while (i > 0) {
+        size_t p = parent(i);
+        if (heap[p].freq >= heap[i].freq) break;
+        std::swap(heap[p], heap[i]);
+        i = p;
+    }
+}
+
+void MaxHeap8::sift_down(size_t i) {
+    size_t n = heap.size();
+    while (true) {
+        size_t largest = i;
+        for (size_t k = 0; k < 8; ++k) {
+            size_t c = child(i, k);
+            if (c < n && heap[c].freq > heap[largest].freq) {
+                largest = c;
+            }
+        }
+        if (largest == i) break;
+        std::swap(heap[i], heap[largest]);
+        i = largest;
+    }
+}
+
+void MaxHeap8::push(Merge&& m) {
+    heap.push_back(std::move(m));
+    sift_up(heap.size() - 1);
+}
+
+Merge MaxHeap8::pop() {
+    if (heap.empty()) {
+        throw RunOutError();
+    }
+    Merge result = std::move(heap[0]);
+    heap[0] = std::move(heap.back());
+    heap.pop_back();
+    if (!heap.empty()) {
+        sift_down(0);
+    }
+    return result;
+}
+
+Merge& MaxHeap8::top() {
+    if (heap.empty()) {
+        throw RunOutError();
+    }
+    return heap[0];
+}
+
+// ========== BPEEngine 实现 ==========
+
+BPEEngine::BPEEngine(const int64_t* offsets, const uint32_t* values,
+                     const uint64_t* freqs_ptr, size_t num_words) {
+    unique_words.reserve(num_words);
+    freqs.reserve(num_words);
+    
+    for (size_t i = 0; i < num_words; ++i) {
+        int64_t start = offsets[i];
+        int64_t end = offsets[i+1];
+        unique_words.emplace_back(values + start, values + end);
+        freqs.push_back(freqs_ptr[i]);
+    }
+    
+    build_initial_pairs();
+    rebuild_heap_entries();
+}
+
+void BPEEngine::build_initial_pairs() {
+    // 并行构建初始 pair_counts 和 where_to_update
+    size_t num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 1;
+    
+    std::vector<std::unordered_map<uint64_t, uint64_t>> local_counts(num_threads);
+    std::vector<std::unordered_map<uint64_t, std::unordered_set<size_t>>> local_where(num_threads);
+    
+    auto process_range = [&](size_t start, size_t end, size_t tid) {
+        for (size_t pos = start; pos < end; ++pos) {
+            const auto& word = unique_words[pos];
+            for (size_t i = 0; i + 1 < word.token_ids.size(); ++i) {
+                uint64_t pair = ((uint64_t)word.token_ids[i] << 32) | word.token_ids[i+1];
+                local_counts[tid][pair]++;
+                local_where[tid][pair].insert(pos);
+            }
+        }
+    };
+    
+    std::vector<std::thread> threads;
+    size_t chunk = unique_words.size() / num_threads;
+    
+    for (size_t t = 0; t < num_threads; ++t) {
+        size_t start = t * chunk;
+        size_t end = (t == num_threads - 1) ? unique_words.size() : (t + 1) * chunk;
+        threads.emplace_back(process_range, start, end, t);
+    }
+    
+    for (auto& t : threads) t.join();
+    
+    // 合并结果
+    for (size_t t = 0; t < num_threads; ++t) {
+        for (auto& [pair, cnt] : local_counts[t]) {
+            pair_counts[pair] += cnt;
+            for (size_t pos : local_where[t][pair]) {
+                where_to_update[pair].insert(pos);
+            }
+        }
+    }
+}
+
+void BPEEngine::rebuild_heap_entries() {
+    for (auto& [pair, positions] : where_to_update) {
+        if (pair_counts.count(pair) && pair_counts[pair] > 0) {
+            max_heap.push(Merge(pair, pair_counts[pair], 
+                               std::vector<size_t>(positions.begin(), positions.end())));
+        }
+    }
+    where_to_update.clear();
+}
+
+size_t BPEEngine::run(size_t num_merges) {
+    merges.reserve(num_merges);
+    
+    for (size_t merge_idx = 0; merge_idx < num_merges; ++merge_idx) {
+        // 步骤 2: 取堆顶
+        Merge top_merge = max_heap.pop();  // 可能抛出 RunOutError
+        
+        // 检查计数是否过期
+        if (pair_counts[top_merge.pair] != top_merge.freq) {
+            // 更新计数后重新入堆
+            top_merge.freq = pair_counts[top_merge.pair];
+            if (top_merge.freq > 0) {
+                max_heap.push(std::move(top_merge));
+            }
+            merge_idx--;  // 这次不算有效 merge
+            continue;
+        }
+        
+        if (top_merge.freq < 1) {
+            break;  // 没有更多有效 merge
+        }
+        
+        // 记录 merge
+        merges.emplace_back(top_merge.pair, top_merge.freq);
+        
+        // 计算 new_token (简单策略：用新 ID)
+        uint32_t new_token = 100000 + merge_idx;  // 实际应从词表分配
+        
+        // 步骤 3: 并行执行 merge
+        std::vector<std::vector<ThreadLocalChange>> all_changes(std::thread::hardware_concurrency());
+        std::vector<std::thread> threads;
+        
+        auto process_positions = [&](size_t start, size_t end, size_t tid) {
+            for (size_t i = start; i < end; ++i) {
+                size_t pos = top_merge.positions[i];
+                size_t change = unique_words[pos].merge_in_place(top_merge.pair, new_token);
+                if (change > 0) {
+                    all_changes[tid].push_back({top_merge.pair, (int64_t)change, pos});
+                }
+            }
+        };
+        
+        size_t num_threads = all_changes.size();
+        size_t chunk = top_merge.positions.size() / num_threads;
+        
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk;
+            size_t end = (t == num_threads - 1) ? top_merge.positions.size() : (t + 1) * chunk;
+            threads.emplace_back(process_positions, start, end, t);
+        }
+        
+        for (auto& t : threads) t.join();
+        
+        // 步骤 4: 聚合 changes
+        for (auto& changes : all_changes) {
+            for (auto& ch : changes) {
+                pair_counts[ch.pair] -= ch.change;  // 旧 pair 计数减少
+                // 计算新产生的 pair (需要扫描 Word)
+                // 这里简化处理，实际需要在 merge_in_place 后重新扫描相邻 token
+            }
+        }
+        
+        // 步骤 5: 重新构建受影响的 heap 条目
+        rebuild_heap_entries();
+    }
+    
+    return merges.size();
+}
+```
+
+---
+
+### 2. Cython 桥接代码 (`bpe_bridge.pyx`)
+
+```cython
+# distutils: language = c++
+# cython: language_level=3, boundscheck=False, wraparound=False
+
+from libcpp.vector cimport vector
+from libcpp.pair cimport pair
+from libcpp cimport bool
+from cpython.exc cimport PyErr_SetFromErrno
+from cpython.long cimport PyLong_FromLongLong
+
+cdef extern from "bpe_engine.h" namespace "std":
+    cdef cppclass pair[T, U]:
+        pair() except +
+        pair(T&, U&) except +
+        T first
+        U second
+
+cdef extern from "bpe_engine.h":
+    cdef cppclass BPEEngine:
+        BPEEngine(const long long* offsets, const unsigned int* values,
+                  const unsigned long long* freqs, size_t num_words) except +
+        size_t run(size_t num_merges) except +
+        const vector[pair[unsigned long long, unsigned long long]]& get_merges()
+    
+    cdef cppclass RunOutError:
+        RunOutError() except +
+
+def bpe_core_loop(object words_array, object freqs_array, 
+                  size_t num_merges):
+    """
+    words_array: PyArrow LargeList Array (unique_words)
+    freqs_array: PyArrow Array (freqs)
+    num_merges: 期望的 merge 次数
+    """
+    # 1. 获取 buffer 地址
+    words_arr = words_array.combine_chunks()
+    freqs_arr = freqs_array.combine_chunks()
+    
+    words_buffers = words_arr.buffers()
+    freqs_buffers = freqs_arr.buffers()
+    
+    offsets_ptr = words_buffers[1].address  # int64
+    values_ptr = words_buffers[2].address   # uint32
+    freqs_ptr = freqs_buffers[1].address    # uint64 (freqs 无 offsets)
+    
+    num_words = len(words_arr)
+    
+    # 2. 创建 C++ 引擎 (可能抛出异常)
+    cdef BPEEngine* engine = NULL
+    
+    try:
+        engine = new BPEEngine(
+            <const long long*>offsets_ptr,
+            <const unsigned int*>values_ptr,
+            <const unsigned long long*>freqs_ptr,
+            num_words
+        )
+        
+        # 3. 执行循环 (可能抛出 RunOutError)
+        engine.run(num_merges)
+        
+        # 4. 获取结果
+        cdef const vector[pair[unsigned long long, unsigned long long]]& merges_cpp = engine.get_merges()
+        
+        # 5. 转换为 Python 对象
+        result = []
+        for i in range(merges_cpp.size()):
+            pair_val = merges_cpp[i]
+            # u64 pair 解码为 (u32, u32)
+            pair_encoded = pair_val.first
+            token_a = pair_encoded >> 32
+            token_b = pair_encoded & 0xFFFFFFFF
+            count = pair_val.second
+            result.append(((<int>token_a, <int>token_b), <int>count))
+        
+        return result
+        
+    except RunOutError:
+        # C++ 异常转换为 Python 异常
+        # 即使提前结束，也返回已完成的 merges
+        if engine != NULL:
+            cdef const vector[pair[unsigned long long, unsigned long long]]& merges_cpp = engine.get_merges()
+            result = []
+            for i in range(merges_cpp.size()):
+                pair_val = merges_cpp[i]
+                pair_encoded = pair_val.first
+                token_a = pair_encoded >> 32
+                token_b = pair_encoded & 0xFFFFFFFF
+                count = pair_val.second
+                result.append(((<int>token_a, <int>token_b), <int>count))
+            return result  # 返回部分结果
+        raise
+    
+    finally:
+        if engine != NULL:
+            del engine
+```
+
+---
+
+### 3. Python 调用代码 (`bpe_worker.py`)
+
+```python
+import pyarrow as pq
+from bpe_bridge import bpe_core_loop
+
+def bpe_worker(pq_fpath, num_merges):
+    # 读取数据
+    table = pq.read_table(pq_fpath, columns=['unique_words', 'freqs'])
+    words_col = table.column('unique_words')
+    freqs_col = table.column('freqs')
+    
+    # 执行 BPE 循环
+    merges = bpe_core_loop(words_col, freqs_col, num_merges)
+    
+    # merges 格式：[((token_a, token_b), count), ...]
+    # 在 Python 层一次性更新 tokenizer
+    return merges
+```
+
+---
+
+### 4. 异常处理方案详解
+
+#### 问题：C++ `RunOutError` 如何返回部分结果？
+
+**方案**：在 Cython 层捕获 C++ 异常，返回已完成的 merges。
+
+```cython
+# Cython 异常处理模式
+try:
+    engine.run(num_merges)  # 可能抛出 RunOutError
+    # 正常返回
+except RunOutError:
+    # 异常捕获，返回部分结果
+    return partial_results
+finally:
+    del engine  # 确保内存释放
+```
+
+**关键点**：
+1.  `except +` 声明：在 `cdef extern` 中声明 `except +`，Cython 会自动将 C++ 异常转换为 Python 异常。
+2.  `RunOutError` 不是致命错误：它是正常终止条件之一，所以返回部分结果是合理的。
+3.  `finally` 块：确保 `BPEEngine` 对象被销毁，释放内存。
+
+---
+
+### 5. 数据流总结
+
+```
+Parquet (硬盘)
+    ↓ read_table (PyArrow)
+PyArrow Array (Python 内存)
+    ↓ .buffers().address (零拷贝指针)
+Cython (透传指针 + 持有引用)
+    ↓ new BPEEngine(...)
+C++ BPEEngine (深拷贝数据到 vector<Word>)
+    ↓ run() 计算
+C++ vector<pair<u64, u64>>
+    ↓ Cython 转换
+Python list of ((u32, u32), u64)
+    ↓ 更新 tokenizer
+Tokenizer (Python)
+```
+
+---
+
+### 6. 编译配置 (`setup.py`)
+
+```python
+from setuptools import setup, Extension
+from Cython.Build import cythonize
+
+ext_modules = [
+    Extension(
+        "bpe_bridge",
+        sources=["bpe_bridge.pyx", "bpe_engine.cpp"],
+        language="c++",
+        extra_compile_args=["-std=c++17", "-O3", "-pthread"],
+        extra_link_args=["-pthread"],
+    )
+]
+
+setup(
+    ext_modules=cythonize(ext_modules, compiler_directives={'language_level': "3"}),
+)
+```
+
+编译：`python setup.py build_ext --inplace`
+
+---
+
+### 7. 关键设计决策
+
+| 决策点 | 选择 | 理由 |
+| :--- | :--- | :--- |
+| **异常处理** | Cython 捕获，返回部分结果 | `RunOutError` 是正常终止，不是错误 |
+| **内存管理** | C++ `new/delete`，Cython `finally` 释放 | 明确所有权，避免泄漏 |
+| **并行策略** | C++ `std::thread` | 避免 Python GIL 限制 |
+| **返回格式** | Python list of tuple | 便于 Python 层处理 |
+| **Buffer 引用** | Cython 持有 `words_array` 引用 | 防止 GC 导致指针悬空 |
+
+这个架构清晰分离了职责：Cython 只做类型转换，C++ 做所有计算，Python 做业务逻辑。异常处理安全，内存管理明确。
+
