@@ -26,7 +26,7 @@ def ask_qwen(chatlogs_json, user_query, render=True):
 
     try:
         response = client.chat.completions.create(
-            model = "qwen3.5-plus",
+            model = "qwen3.6-max-preview",
             messages = conversation_context
         )
 
