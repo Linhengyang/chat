@@ -38,4 +38,4 @@ def render_json(chatlogs_json):
 
 
 if __name__ == "__main__":
-    render_json('chatlogs/cpp_heap.json')
+    render_json('chatlogs/split_cppcode.json')
