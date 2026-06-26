@@ -5,12 +5,10 @@
 🙋**user**:
 ---
 ```
- 
 我希望用优先队列实现 lazy-delete, 即从heap中pop出顶端node后（如果pop失败，则throw一个error）, 检查node的cnts是否与即时更新的记录一致，如果不一致, 更新node的cnts然后将node重新push入heap；如果一致，使用该node的成员变量并析构它。
 首先告诉我，为什么要采取这种“改值之后重新push入堆”的方式？可以堆顶node改变值之后，直接对该node作sift_down操作来完成一次堆自更新吗？
 其次，因为每个node组成是 std::tuple<uint64, uint64, vector>, 这个vector所占资源比较大，我希望堆的pop堆顶、push入堆底的操作，都可以是移动语义以减少拷贝负担。
 这部分的CPP代码怎么写？
-
 ```
 
 ---
