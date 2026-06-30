@@ -2882,3 +2882,152 @@ def get_entities_by_reference_id_fast(reference_msg_id: str):
     *   如果你**不想改表结构**，且目前数据量很小（几千条以内），直接用 **方案 A** 的 `LIKE` 查询。
     *   如果你希望代码**具备生产级别的健壮性**，且未来数据量会持续增长，**请务必花 10 分钟改成 方案 B**。把需要查询的业务字段（如 `task_id`, `user_id`）从巨大的 JSON 中提取出来作为独立列并加索引，这是后端开发中“用空间换时间”的经典优化手段。
 
+
+---
+🙋**user**:
+---
+```
+我希望限制反查的条数，即只在最近1000条行里查
+```
+
+---
+🤖**assistant**:
+---
+
+要实现“只在最近 1000 条记录中查找”，在 SQL 中最优雅且高效的做法是使用**子查询（Subquery）**。
+
+我们可以先让 SQLite 利用主键索引瞬间捞出最新的 1000 条数据，然后再在这个极小的结果集中进行条件过滤。
+
+下面我为你提供修改后的代码。为了严谨，我同时给出了 **“治本”（推荐，有独立 task_id 字段）** 和 **“治标”（用 LIKE 模糊匹配）** 两个版本，你可以根据你目前实际采用的表结构选择对应的函数。
+
+### 核心 SQL 逻辑解析
+
+```sql
+SELECT output_payload 
+FROM (
+    -- 1. 内层查询：利用主键 id 的索引，极速倒序取出最新的 1000 条
+    SELECT output_payload, task_id 
+    FROM api_logs 
+    ORDER BY id DESC 
+    LIMIT 1000
+) AS recent_logs
+-- 2. 外层查询：在这 1000 条数据中精准匹配 task_id
+WHERE task_id = ? 
+LIMIT 1;
+```
+*性能说明：因为 `id` 是自增主键，`ORDER BY id DESC LIMIT 1000` 不会引发全表扫描，而是直接走 B-Tree 索引从尾部读取，性能极高。外层在 1000 条内存数据中过滤也是瞬间完成。*
+
+---
+
+### 完整 Python 查询代码
+
+你可以将以下函数放在你的业务代码中（比如一个新的路由或工具类里）：
+
+```python
+import sqlite3
+import json
+import os
+
+DB_PATH = "/data/logs/api_monitor.db" # 确保与 monitor.py 中的路径一致
+
+def get_entities_by_reference_id(reference_msg_id: str, use_exact_match: bool = True):
+    """
+    根据 referenceMsgID 在最近 1000 条日志中查找 output_payload 并提取 data.entities
+    
+    :param reference_msg_id: 要查找的 task_id / referenceMsgID
+    :param use_exact_match: True 使用治本方案(task_id字段)，False 使用治标方案(LIKE模糊匹配)
+    """
+    if not os.path.exists(DB_PATH):
+        print("[Query] DB file not found.")
+        return None
+
+    # 只读模式打开，防止和 Web 服务的写入线程产生锁冲突
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    cur = conn.cursor()
+    
+    try:
+        if use_exact_match:
+            # ================= 方案 B：治本方案 (推荐) =================
+            # 前提：你的 api_logs 表里有独立的 task_id 字段
+            query = """
+                SELECT output_payload 
+                FROM (
+                    SELECT output_payload, task_id 
+                    FROM api_logs 
+                    ORDER BY id DESC 
+                    LIMIT 1000
+                ) AS recent_logs
+                WHERE task_id = ?
+                LIMIT 1
+            """
+            cur.execute(query, (reference_msg_id,))
+        else:
+            # ================= 方案 A：治标方案 =================
+            # 前提：没有 task_id 字段，只能在 output_payload 里 LIKE 模糊搜索
+            query = """
+                SELECT output_payload 
+                FROM (
+                    SELECT output_payload 
+                    FROM api_logs 
+                    ORDER BY id DESC 
+                    LIMIT 1000
+                ) AS recent_logs
+                WHERE output_payload LIKE ?
+                LIMIT 1
+            """
+            # 构造模糊匹配模式
+            like_pattern = f'%"task_id"%"%{reference_msg_id}"%'
+            cur.execute(query, (like_pattern,))
+            
+        row = cur.fetchone()
+        
+    finally:
+        conn.close()
+        
+    # 如果没有查到数据
+    if not row or not row[0]:
+        print(f"[Query] Not found in recent 1000 logs for ID: {reference_msg_id}")
+        return None
+        
+    # 在 Python 层解析 JSON 并安全提取 data.entities
+    try:
+        payload_dict = json.loads(row[0])
+        
+        # 安全地提取 data.entities，防止中间某一层是 None 导致 AttributeError
+        data_section = payload_dict.get("data")
+        if isinstance(data_section, dict):
+            return data_section.get("entities")
+        
+        return None
+        
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"[Query] Failed to parse JSON for ID {reference_msg_id}: {e}")
+        return None
+```
+
+### 使用示例
+
+在你的 FastAPI 路由中，你可以这样调用它：
+
+```python
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter()
+
+@router.get("/get_entities/{ref_id}")
+async def get_entities(ref_id: str):
+    # 假设你已经升级了表结构，使用精准匹配 (use_exact_match=True)
+    entities = get_entities_by_reference_id(ref_id, use_exact_match=True)
+    
+    if entities is None:
+        raise HTTPException(status_code=404, detail="Entities not found in recent 1000 requests")
+        
+    return {"reference_id": ref_id, "entities": entities}
+```
+
+### 💡 业务逻辑上的一个小提示
+
+加上了 `LIMIT 1000` 的限制后，意味着**如果这个 `referenceMsgID` 是在 1001 条或更早的请求中产生的，这个查询将返回 `None`（查不到）**。
+
+这在业务上通常是合理的（比如只关联最近几分钟/几小时的上下文），但你需要确保前端或调用方能够妥善处理“查不到”的情况（比如提示用户“上下文已过期”），而不是让程序直接崩溃。
+
