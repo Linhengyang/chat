@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # 加载 .env 环境变量
 load_dotenv()
 
-def ask_qwen(chatlogs_json, user_query, render=True):
+def ask_qwen(chatlogs_json, user_query, render=True, history=True):
 
     client = OpenAI(
         api_key = os.getenv("DASHSCOPE_API_KEY"),
@@ -18,6 +18,9 @@ def ask_qwen(chatlogs_json, user_query, render=True):
 
     with open(chatlogs_json) as f:
         conversation_context = json.load(f)
+
+    if not history:
+        conversation_context = [conversation_context[0]]
 
     conversation_context.append({
         "role": "user", 
