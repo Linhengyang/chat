@@ -29,7 +29,7 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
 
     try:
         response = client.chat.completions.create(
-            model = "qwen3.7-max",
+            model = "qwen3.8-max",
             messages = conversation_context
         )
 
