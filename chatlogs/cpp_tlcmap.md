@@ -1852,3 +1852,103 @@ int main() {
 2. **Test 2** 使用 8 个线程并发执行 50,000 次 `insert` 和 `pop`，验证了 TLC (Thread-Local Cache) 在高并发下的无锁回收性能，以及最终 `size` 归零的准确性。
 3. **Test 3 (核心)**：专门针对你设计的 `_generation` 机制进行**极限压力测试**。一个线程在不断 insert/pop，另一个线程在不断执行 `clear()` 并 `reset()` Arena。如果没有 generation 机制，这里 100% 会发生 Use-After-Free 导致 Segmentation Fault。加入你的设计后，程序能平稳跑完不崩溃。
 
+
+---
+🙋**user**:
+---
+```
+修改注册表TLSregistry的方法get_or_create_tls_free_list，难道不需要并发安全吗？比如给entries上锁什么的。感觉当多个同类型哈希表实例多线程并发insert时，是有可能同时往注册表里写入实例指针<->tls free_list的entry的。这里是否要考虑并发安全？
+```
+
+---
+🤖**assistant**:
+---
+
+## 不需要加锁，`thread_local` 已经天然保证了线程安全
+
+你的担忧很自然，但这里有一个关键点需要厘清：
+
+### `thread_local` 的核心语义
+
+```cpp
+static thread_local TLSRegistry tls_registry;
+```
+
+这行代码的含义是：**每个线程拥有自己独立的 `tls_registry` 副本**。
+
+```
+线程 A  ──→  tls_registry_A（线程A私有）
+线程 B  ──→  tls_registry_B（线程B私有）
+线程 C  ──→  tls_registry_C（线程C私有）
+```
+
+它们是完全独立的内存区域，**不同线程之间永远不会访问同一个 `TLSRegistry` 对象**。
+
+### 逐场景分析
+
+**场景 1：多线程并发操作同一个哈希表实例**
+
+```cpp
+// 线程A: map.insert(1, "a")
+// 线程B: map.insert(2, "b")
+// 线程C: map.insert(3, "c")
+```
+
+- 线程 A 进入 `get_tls_free_list()` → 访问 `tls_registry_A`
+- 线程 B 进入 `get_tls_free_list()` → 访问 `tls_registry_B`
+- 线程 C 进入 `get_tls_free_list()` → 访问 `tls_registry_C`
+
+三个线程操作的是**不同的内存**，零竞争，无需加锁。
+
+**场景 2：同一线程交替操作多个哈希表实例**
+
+```cpp
+// 线程A:
+map1.insert(1, "a");  // 访问 tls_registry_A，写入 entry[0] = &map1
+map2.insert(2, "b");  // 访问 tls_registry_A，写入 entry[1] = &map2
+map1.insert(3, "c");  // 访问 tls_registry_A，命中 entry[0] = &map1
+```
+
+同一个线程是**顺序执行**的，不存在并发，无需加锁。
+
+**场景 3：你担心的"同时写入"**
+
+> 多个同类型哈希表实例多线程并发insert时，是有可能同时往注册表里写入
+
+这个"同时写入"不会发生，因为：
+
+| 线程 | 操作的哈希表 | 访问的 Registry |
+|------|-------------|----------------|
+| A | map1, map2 | tls_registry_**A** |
+| B | map1, map2 | tls_registry_**B** |
+| C | map3 | tls_registry_**C** |
+
+线程 A 和线程 B 虽然操作同一个 `map1`，但它们写入的是**各自的** registry 副本，互不干扰。
+
+### 这正是选择 `thread_local` 的原因
+
+回顾整个 TLC 设计的分层：
+
+```
+┌─────────────────────────────────────────────────┐
+│  TLS 层（thread_local）                          │
+│  → 纯单线程操作，零锁零原子                       │
+│  → get_node_from_tls / push_node_to_tls         │
+│  → TLSRegistry 也属于这一层                      │
+├─────────────────────────────────────────────────┤
+│  Global 层（std::mutex）                        │
+│  → 跨线程共享，需要加锁                          │
+│  → refill_tls_from_global / flush_tls_to_global │
+│  → _global_free_head                            │
+├─────────────────────────────────────────────────┤
+│  Arena 层                                       │
+│  → 最终兜底分配                                  │
+└─────────────────────────────────────────────────┘
+```
+
+`TLSRegistry` 属于 **TLS 层**，它的设计初衷就是"每个线程私有的小缓存"，所以天然不需要任何同步原语。如果给它加锁，反而违背了 TLC 的设计初衷——**用空间换时间，用线程隔离换无锁**。
+
+### 结论
+
+**不需要给 `TLSRegistry` 加任何锁。** `thread_local` 已经提供了最强的隔离保证：每个线程独占自己的 registry，不同线程之间零共享、零竞争。这是整个 TLC 设计中"零锁零原子"承诺的基础。
+
