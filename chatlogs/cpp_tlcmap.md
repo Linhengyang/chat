@@ -1952,3 +1952,157 @@ map1.insert(3, "c");  // 访问 tls_registry_A，命中 entry[0] = &map1
 
 **不需要给 `TLSRegistry` 加任何锁。** `thread_local` 已经提供了最强的隔离保证：每个线程独占自己的 registry，不同线程之间零共享、零竞争。这是整个 TLC 设计中"零锁零原子"承诺的基础。
 
+
+---
+🙋**user**:
+---
+```
+关于insert/upsert方法里rehash操作前的解锁, 用大花括号RAII unlock, 和主动 .unlock, 真的正如你说那样有差别?
+```
+
+---
+🤖**assistant**:
+---
+
+你的质疑非常对。我之前那句"会导致 double-unlock 从而 `std::terminate`"的说法**不准确**，需要向你更正。
+
+### 结论先行
+
+在你这段代码里，手动 `.unlock()` 和 RAII 大括号**在正确性上是等价的**，手动 unlock 并不会造成 double-unlock。
+
+### 为什么手动 unlock 是安全的
+
+关键在于 `std::shared_lock` / `std::unique_lock` 内部维护了一个 `owns()` 状态：
+
+```cpp
+_lock_table_from_rehash_clear_.unlock();
+// 后置条件: owns() == false
+```
+
+而析构函数的行为是：
+
+```cpp
+~shared_lock() {
+    if (owns()) {          // 只有 owns() 为 true 才解锁
+        mutex()->unlock_shared();
+    }
+}
+```
+
+所以执行流程是：
+
+```
+手动 unlock()  →  owns() 变为 false  →  析构时检查 owns() == false  →  不再 unlock
+```
+
+**锁只被释放了一次，不会 double-unlock，不会 terminate。**
+
+### 我之前的说法错在哪
+
+我把"手动 unlock"和"对已经 unlock 的锁再次手动 unlock"混淆了。真正危险的是后者：
+
+```cpp
+lock.unlock();
+lock.unlock();   // 第二次：owns() == false，违反前置条件
+                 // 这才是 UB / 抛 std::system_error 的场景
+```
+
+但你的代码只调用了一次 unlock，完全合法。
+
+### 那 RAII 大括号到底好在哪
+
+既然正确性等价，RAII 的优势就只剩**工程层面**：
+
+**1. 意图表达更清晰**
+
+```cpp
+// RAII：锁的生命周期一目了然
+{
+    std::shared_lock<std::shared_mutex> lock(_table_mutex);
+    // ... 持锁操作 ...
+} // ← 这里释放，读者不用往下找
+if (_size.load() >= ...) { ... }
+```
+
+```cpp
+// 手动 unlock：读者必须跟踪 owns 状态
+std::shared_lock<std::shared_mutex> lock(_table_mutex);
+// ... 持锁操作 ...
+lock.unlock();   // ← 要读到这一行才知道锁释放了
+if (_size.load() >= ...) { ... }
+```
+
+**2. 防御未来的修改**
+
+假设半年后有人在这里加代码：
+
+```cpp
+lock.unlock();
+
+// 新人加了一段，误以为还持有 table 锁
+do_something_that_needs_table_lock();   // 逻辑 bug，但编译器不报错
+
+if (_size.load() >= ...) { ... }
+```
+
+RAII 大括号能通过**结构**阻止这种错误——大括号外的代码天然不持锁。
+
+**3. 与你的代码风格一致**
+
+你的 bucket 锁已经用了大括号 RAII：
+
+```cpp
+{
+    std::unique_lock<std::shared_mutex> _lock_bucket_for_insert_(bucket_lock(index));
+    ...
+}
+```
+
+table 锁也用大括号，风格统一，review 时认知负担更低。
+
+### 针对你代码的建议
+
+两种写法都正确，你可以自由选择。如果保留手动 unlock，建议加一行注释说明：
+
+```cpp
+// 释放 table 共享锁，为 rehash 获取独占锁做准备
+// 此时 owns() == false，析构时不会重复解锁
+_lock_table_from_rehash_clear_.unlock();
+
+if (_size.load(std::memory_order_relaxed) >= _resize_threshold.load(std::memory_order_relaxed)) {
+    std::unique_lock<std::shared_mutex> _lock_table_for_rehash_(_table_mutex);
+    ...
+}
+```
+
+如果改成 RAII 大括号，就是：
+
+```cpp
+{
+    std::shared_lock<std::shared_mutex> _lock_table_from_rehash_clear_(_table_mutex);
+    if (_capacity == 0 || !_table) return false;
+    size_t index = hash(key) % _capacity;
+    {
+        std::unique_lock<std::shared_mutex> _lock_bucket(bucket_lock(index));
+        ...
+        _size.fetch_add(1, std::memory_order_relaxed);
+    }
+} // ← table 共享锁在这里释放
+
+if (_size.load(std::memory_order_relaxed) >= _resize_threshold.load(std::memory_order_relaxed)) {
+    std::unique_lock<std::shared_mutex> _lock_table_for_rehash_(_table_mutex);
+    ...
+}
+```
+
+两者行为完全一致，纯粹是风格选择。
+
+### 总结
+
+- 我之前"double-unlock / terminate"的说法是错的，向你更正。
+- `std::shared_lock` 手动 unlock 后再析构是安全的，因为 `owns()` 会变 false。
+- RAII 大括号的真正价值是**可读性、可维护性、防御未来修改**，不是正确性必需。
+- 你的代码逻辑本身没有问题，可以放心保留手动 unlock。
+
+感谢你的追问，这种较真对并发代码非常重要。
+
