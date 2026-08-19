@@ -2106,3 +2106,122 @@ if (_size.load(std::memory_order_relaxed) >= _resize_threshold.load(std::memory_
 
 感谢你的追问，这种较真对并发代码非常重要。
 
+
+---
+🙋**user**:
+---
+```
+编译时报错如下：
+in function `TLS wrapper function for pooled_concurrent_hashtable<int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, threadsafe_singleton_mempool, std::hash<int> >::tls_registry':
+test_concurrent_hashtable.cpp:(.text._ZTWN27pooled_concurrent_hashtableIiNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE28threadsafe_singleton_mempoolSt4hashIiEE12tls_registryE[_ZTWN27pooled_concurrent_hashtableIiNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE28threadsafe_singleton_mempoolSt4hashIiEE12tls_registryE]+0x19): undefined reference to `pooled_concurrent_hashtable<int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, threadsafe_singleton_mempool, std::hash<int> >::tls_registry'
+```
+
+---
+🤖**assistant**:
+---
+
+## 原因
+
+这是一个经典的 **模板类 `static thread_local` 成员只有声明、没有定义** 的链接错误。
+
+你在类内写了：
+
+```cpp
+static thread_local TLSRegistry tls_registry;  // 这只是声明
+```
+
+但模板类的 static 成员必须在类外提供**定义**，链接器才能找到实际的存储空间。
+
+---
+
+## 解决方案
+
+### 方案 A：C++17 及以上（推荐，最简单）
+
+在类内加上 `inline`，一行搞定，不需要类外定义：
+
+```cpp
+// 类内，把原来的声明改成：
+inline static thread_local TLSRegistry tls_registry;
+```
+
+`inline` 变量（C++17）允许在头文件中定义，多个翻译单元包含同一头文件也不会产生重复定义错误。
+
+---
+
+### 方案 B：C++14 及以下（或不想用 inline）
+
+在类外、**头文件中**（不是 .cpp 中）添加模板定义：
+
+```cpp
+// ===== 放在头文件中，类定义之后 =====
+
+template <typename TYPE_K, typename TYPE_V, typename TYPE_MEMPOOL, typename HASH_FUNC>
+thread_local typename pooled_concurrent_hashtable<TYPE_K, TYPE_V, TYPE_MEMPOOL, HASH_FUNC>::TLSRegistry
+    pooled_concurrent_hashtable<TYPE_K, TYPE_V, TYPE_MEMPOOL, HASH_FUNC>::tls_registry;
+```
+
+注意三个要点：
+
+| 要点 | 说明 |
+|------|------|
+| 类外不加 `static` | `static` 只在类内声明时使用 |
+| 类外保留 `thread_local` | 存储类别必须一致 |
+| 需要 `typename` | `TLSRegistry` 是依赖类型名称 |
+
+---
+
+## 为什么必须放在头文件
+
+模板的 static 成员和普通类的 static 成员不同：
+
+```
+普通类：  static 成员在 .cpp 中定义一次 → 链接器找到唯一实例
+模板类：  每个实例化 <int,string,...>、<long,long,...> 各需要一份
+         → 定义必须对每个使用它的翻译单元可见
+         → 只能放在头文件中
+```
+
+如果放在 .cpp 中，其他翻译单元实例化模板时看不到定义，同样会报 `undefined reference`。
+
+---
+
+## 完整示例（方案 A）
+
+```cpp
+template <typename TYPE_K, typename TYPE_V, typename TYPE_MEMPOOL, typename HASH_FUNC = std::hash<TYPE_K>>
+class pooled_concurrent_hashtable {
+private:
+    // ...
+
+    struct TLSRegistry {
+        static constexpr size_t MAX_INSTANCES = 4;
+        struct Entry {
+            const pooled_concurrent_hashtable* owner = nullptr;
+            TLSFreeList free_list;
+        };
+        std::array<Entry, MAX_INSTANCES> entries{};
+        size_t count = 0;
+
+        TLSFreeList* get_or_create_tls_free_list(pooled_concurrent_hashtable* owner) {
+            for (size_t i = 0; i < count; ++i) {
+                if (entries[i].owner == owner) return &entries[i].free_list;
+            }
+            if (count < MAX_INSTANCES) {
+                entries[count].owner = owner;
+                entries[count].free_list = {nullptr, 0, 0};
+                return &entries[count++].free_list;
+            }
+            return nullptr;
+        }
+    };
+
+    // ✅ C++17: inline 使得类内即为定义，无需类外再写
+    inline static thread_local TLSRegistry tls_registry;
+
+    // ...
+};
+```
+
+如果你的编译器是 GCC/Clang 且开启了 `-std=c++17` 或更高，方案 A 最干净。如果是 C++14，用方案 B。
+
