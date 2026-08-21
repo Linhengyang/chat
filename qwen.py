@@ -13,7 +13,7 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
 
     client = OpenAI(
         api_key = os.getenv("DASHSCOPE_API_KEY"),
-        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url = f"https://{os.getenv("DASHSCOPE_URL")}/compatible-mode/v1",
     )
 
     with open(chatlogs_json) as f:
@@ -29,7 +29,7 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
 
     try:
         response = client.chat.completions.create(
-            model = "qwen3.8-max",
+            model = "qwen3.7-max",
             messages = conversation_context
         )
 
