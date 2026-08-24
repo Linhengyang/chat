@@ -26,21 +26,35 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
         "role": "user", 
         "content": user_query
     })
-
+    
+    content = ""
+    usage = None
     try:
-        response = client.chat.completions.create(
-            model = "qwen3.7-max",
-            messages = conversation_context
+        completion = client.chat.completions.create(
+            model = "qwen3.8-max",
+            messages = conversation_context,
+            stream = True,
+            stream_options = {"include_usage": True}
         )
+        for chunk in completion:
+            for choice in chunk.choices:
+                if choice.delta and choice.delta.content:
+                    content += choice.delta.content
+
+            if chunk.usage:
+                usage = chunk.usage
 
     except Exception as e:
         print(f"错误信息：{e}")
         print("请参考文档: https://help.aliyun.com/model-studio/developer-reference/error-code")
+
     
     llm_reply = {
         "role": "assistant", 
-        "content": response.choices[0].message.content
+        "content": content,
     }
+    if usage:
+        print(usage)
 
     conversation_context.append(llm_reply)
 
