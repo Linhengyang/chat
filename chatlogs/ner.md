@@ -1620,3 +1620,2292 @@ event 管“状态是怎么变化的”
 
 这样你的服务才能从单条消息 NER，真正升级成多轮交易对话理解服务。
 
+
+---
+🙋**user**:
+---
+```
+好。那么请根据你给出的增量处理方案，落地一份代码。要求用Python-FastAPI框架，所有的落盘数据采用sqlite。session采用前端不带session_id，留一个sessionResolver接口。要求做好代码拆分：src/models.py存储所有Pydantic模型，/data存储所有sqlite db文件, 以及其他必要文件和目录
+```
+
+---
+🤖**assistant**:
+---
+
+下面给你一份**最小可运行、可继续扩展**的落地代码。
+
+这份代码实现了：
+
+1. 前端不传 `session_id`
+2. 后端通过 `SessionResolver` 自动推断 / 创建 / 复用 `session`
+3. 使用 SQLite 落盘所有数据，数据库文件放在 `data/` 目录
+4. 每次新消息进来：
+   - 解析所属 `session`
+   - 读取当前 `trade_drafts`
+   - 读取最近历史消息
+   - 调用 `ActionExtractor` 输出增量 `Actions`
+   - 后端根据 `Actions` 更新 `trade_draft`
+   - 记录状态变更事件
+5. 代码拆分清晰：
+   - `src/models.py`：所有 Pydantic 模型
+   - `src/db.py`：SQLite 连接与初始化
+   - `src/state_store.py`：状态存储与状态合并
+   - `src/session_resolver.py`：session 解析接口
+   - `src/llm.py`：LLM/ActionExtractor 接口，默认提供 Mock 实现
+   - `src/service.py`：主流程编排
+   - `src/api.py`：FastAPI 路由
+
+---
+
+# 1. 项目目录
+
+建议按下面目录创建：
+
+```text
+trade-dialogue-ner/
+├── main.py
+├── requirements.txt
+├── README.md
+├── data/
+│   └── .gitkeep
+└── src/
+    ├── __init__.py
+    ├── config.py
+    ├── models.py
+    ├── db.py
+    ├── state_store.py
+    ├── session_resolver.py
+    ├── llm.py
+    ├── service.py
+    └── api.py
+```
+
+---
+
+# 2. requirements.txt
+
+```txt
+fastapi
+uvicorn[standard]
+pydantic>=2
+```
+
+---
+
+# 3. data/.gitkeep
+
+空文件即可：
+
+```text
+```
+
+---
+
+# 4. src/__init__.py
+
+```python
+```
+
+---
+
+# 5. src/config.py
+
+```python
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "app.db"
+
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+
+# mock / qwen
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
+```
+
+---
+
+# 6. src/models.py
+
+```python
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class IncomingMessage(BaseModel):
+    """
+    原始聊天消息。
+    前端不传 session_id。
+    """
+    message_id: Optional[str] = None
+    sender_id: str
+    receiver_id: Optional[str] = None
+    group_id: Optional[str] = None
+    channel: str = "default"
+    content: str
+    ts: Optional[datetime] = None
+
+
+class ActionType(str, Enum):
+    CREATE = "CREATE"
+    UPDATE = "UPDATE"
+    CONFIRM = "CONFIRM"
+    REJECT = "REJECT"
+    CANCEL = "CANCEL"
+    CLARIFY = "CLARIFY"
+    NOOP = "NOOP"
+
+
+class ActionTarget(BaseModel):
+    """
+    LLM 对交易草稿的定位线索。
+    """
+    draft_id: Optional[str] = None
+    asset_name: Optional[str] = None
+    asset_code: Optional[str] = None
+    reference_expression: Optional[str] = None
+    ordinal: Optional[int] = None
+
+
+class Action(BaseModel):
+    """
+    单条增量操作指令。
+    """
+    action_type: ActionType
+    target: Optional[ActionTarget] = None
+    updates: Dict[str, Any] = Field(default_factory=dict)
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+
+
+class LLMActionsResponse(BaseModel):
+    """
+    LLM/ActionExtractor 输出。
+    """
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+
+
+class SlotState(BaseModel):
+    """
+    单个字段的状态。
+    """
+    value: Any
+    status: str = "proposed"  # proposed / confirmed / rejected / ambiguous
+    source_message_id: Optional[str] = None
+    confidence: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class TradeDraft(BaseModel):
+    """
+    一笔交易草稿。
+    """
+    draft_id: str
+    session_id: str
+    asset_name: Optional[str] = None
+    asset_code: Optional[str] = None
+    direction: Optional[str] = None
+    amount: Optional[float] = None
+    price: Optional[float] = None
+    status: str = "negotiating"  # negotiating / confirmed / rejected / cancelled
+    slots: Dict[str, SlotState] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class Session(BaseModel):
+    """
+    一次交易协商上下文。
+    """
+    session_id: str
+    conversation_key: str
+    channel: str
+    status: str = "negotiating"  # negotiating / closed / expired / cancelled
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+
+
+class MessageRecord(BaseModel):
+    """
+    落盘后的消息记录。
+    """
+    message_id: str
+    session_id: str
+    sender_id: str
+    receiver_id: Optional[str] = None
+    group_id: Optional[str] = None
+    channel: str = "default"
+    content: str
+    ts: datetime
+    created_at: Optional[datetime] = None
+
+
+class DraftEvent(BaseModel):
+    """
+    状态变更事件，用于审计、回滚、反馈。
+    """
+    event_id: str
+    session_id: str
+    draft_id: Optional[str] = None
+    message_id: Optional[str] = None
+    action_type: str
+    field: Optional[str] = None
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    reasoning: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class ProcessResult(BaseModel):
+    """
+    单次消息处理结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+
+
+class SessionResolveResult(BaseModel):
+    """
+    SessionResolver 调试/解析接口返回。
+    """
+    session_id: str
+    conversation_key: str
+    created: bool
+    session: Session
+
+
+class SessionDetail(BaseModel):
+    """
+    查询 session 详情。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    messages: List[MessageRecord] = Field(default_factory=list)
+```
+
+---
+
+# 7. src/db.py
+
+```python
+import sqlite3
+from contextlib import contextmanager
+
+from .config import DB_PATH
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'negotiating',
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expired_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_conversation
+ON sessions(conversation_key, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    receiver_id TEXT,
+    group_id TEXT,
+    channel TEXT,
+    content TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session
+ON messages(session_id, ts);
+
+CREATE TABLE IF NOT EXISTS trade_drafts (
+    draft_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    asset_name TEXT,
+    asset_code TEXT,
+    direction TEXT,
+    amount REAL,
+    price REAL,
+    status TEXT NOT NULL DEFAULT 'negotiating',
+    slots_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_drafts_session
+ON trade_drafts(session_id);
+
+CREATE TABLE IF NOT EXISTS draft_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    draft_id TEXT,
+    message_id TEXT,
+    action_type TEXT,
+    field TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    reasoning TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_events_session
+ON draft_events(session_id);
+"""
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def get_db():
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.executescript(SCHEMA)
+```
+
+---
+
+# 8. src/state_store.py
+
+```python
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+from .models import (
+    ActionType,
+    DraftEvent,
+    IncomingMessage,
+    MessageRecord,
+    Session,
+    SlotState,
+    TradeDraft,
+)
+
+ALLOWED_DRAFT_FIELDS = {
+    "asset_name",
+    "asset_code",
+    "direction",
+    "amount",
+    "price",
+}
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(value) if value else None
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def to_json_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def normalize_updates(updates: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    result = dict(updates or {})
+
+    for field in ("amount", "price"):
+        if field in result and result[field] is not None:
+            try:
+                result[field] = float(result[field])
+            except Exception:
+                pass
+
+    return result
+
+
+# ----------------------------
+# row converters
+# ----------------------------
+
+def row_to_session(row) -> Session:
+    return Session(
+        session_id=row["session_id"],
+        conversation_key=row["conversation_key"],
+        channel=row["channel"],
+        status=row["status"],
+        started_at=parse_iso(row["started_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+        expired_at=parse_iso(row["expired_at"]),
+    )
+
+
+def row_to_message(row) -> MessageRecord:
+    return MessageRecord(
+        message_id=row["message_id"],
+        session_id=row["session_id"],
+        sender_id=row["sender_id"],
+        receiver_id=row["receiver_id"],
+        group_id=row["group_id"],
+        channel=row["channel"] or "default",
+        content=row["content"],
+        ts=parse_iso(row["ts"]),
+        created_at=parse_iso(row["created_at"]),
+    )
+
+
+def row_to_draft(row) -> TradeDraft:
+    slots_raw = json.loads(row["slots_json"] or "{}")
+    slots = {
+        key: SlotState(**value)
+        for key, value in slots_raw.items()
+    }
+
+    return TradeDraft(
+        draft_id=row["draft_id"],
+        session_id=row["session_id"],
+        asset_name=row["asset_name"],
+        asset_code=row["asset_code"],
+        direction=row["direction"],
+        amount=row["amount"],
+        price=row["price"],
+        status=row["status"],
+        slots=slots,
+        created_at=parse_iso(row["created_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+    )
+
+
+def row_to_event(row) -> DraftEvent:
+    return DraftEvent(
+        event_id=row["event_id"],
+        session_id=row["session_id"],
+        draft_id=row["draft_id"],
+        message_id=row["message_id"],
+        action_type=row["action_type"],
+        field=row["field"],
+        old_value=row["old_value"],
+        new_value=row["new_value"],
+        reasoning=row["reasoning"],
+        created_at=parse_iso(row["created_at"]),
+    )
+
+
+# ----------------------------
+# session
+# ----------------------------
+
+def get_session(conn, session_id: str) -> Optional[Session]:
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+
+
+def find_active_session(
+    conn,
+    conversation_key: str,
+    timeout_minutes: int,
+) -> Optional[Session]:
+    threshold = utcnow() - timedelta(minutes=timeout_minutes)
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        WHERE conversation_key = ?
+          AND status IN ('active', 'negotiating')
+          AND updated_at >= ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (conversation_key, threshold.isoformat()),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+
+
+def create_session(
+    conn,
+    conversation_key: str,
+    channel: str,
+    timeout_minutes: int = 30,
+) -> Session:
+    session_id = new_id("session")
+    now = utcnow()
+    expired_at = now + timedelta(minutes=timeout_minutes)
+
+    conn.execute(
+        """
+        INSERT INTO sessions (
+            session_id,
+            conversation_key,
+            channel,
+            status,
+            started_at,
+            updated_at,
+            expired_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            conversation_key,
+            channel,
+            "negotiating",
+            iso(now),
+            iso(now),
+            iso(expired_at),
+        ),
+    )
+
+    session = get_session(conn, session_id)
+    assert session is not None
+    return session
+
+
+def touch_session(
+    conn,
+    session_id: str,
+    timeout_minutes: int = 30,
+) -> None:
+    now = utcnow()
+    expired_at = now + timedelta(minutes=timeout_minutes)
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET updated_at = ?, expired_at = ?
+        WHERE session_id = ?
+        """,
+        (iso(now), iso(expired_at), session_id),
+    )
+
+
+# ----------------------------
+# message
+# ----------------------------
+
+def upsert_message(
+    conn,
+    message: IncomingMessage,
+    session_id: str,
+) -> str:
+    message_id = message.message_id or new_id("msg")
+    ts = message.ts or utcnow()
+    created_at = utcnow()
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO messages (
+            message_id,
+            session_id,
+            sender_id,
+            receiver_id,
+            group_id,
+            channel,
+            content,
+            ts,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message_id,
+            session_id,
+            message.sender_id,
+            message.receiver_id,
+            message.group_id,
+            message.channel,
+            message.content,
+            iso(ts),
+            iso(created_at),
+        ),
+    )
+
+    return message_id
+
+
+def list_recent_messages(
+    conn,
+    session_id: str,
+    limit: int = 20,
+) -> List[MessageRecord]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM messages
+        WHERE session_id = ?
+        ORDER BY ts ASC, rowid ASC
+        LIMIT ?
+        """,
+        (session_id, limit),
+    ).fetchall()
+
+    return [row_to_message(row) for row in rows]
+
+
+# ----------------------------
+# trade draft
+# ----------------------------
+
+def get_draft(conn, draft_id: str) -> Optional[TradeDraft]:
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_draft(row)
+
+
+def list_drafts(conn, session_id: str) -> List[TradeDraft]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM trade_drafts
+        WHERE session_id = ?
+        ORDER BY created_at ASC, rowid ASC
+        """,
+        (session_id,),
+    ).fetchall()
+
+    return [row_to_draft(row) for row in rows]
+
+
+def create_draft(
+    conn,
+    session_id: str,
+    updates: Dict[str, Any],
+    message_id: Optional[str] = None,
+) -> TradeDraft:
+    updates = normalize_updates(updates)
+
+    draft_id = new_id("draft")
+    now = utcnow()
+
+    asset_name = updates.get("asset_name")
+    asset_code = updates.get("asset_code")
+    direction = updates.get("direction")
+    amount = updates.get("amount")
+    price = updates.get("price")
+
+    slots: Dict[str, Any] = {}
+
+    for field in ALLOWED_DRAFT_FIELDS:
+        value = updates.get(field)
+        if value is None:
+            continue
+
+        slots[field] = SlotState(
+            value=value,
+            status="proposed",
+            source_message_id=message_id,
+            updated_at=now,
+        ).model_dump(mode="json")
+
+    conn.execute(
+        """
+        INSERT INTO trade_drafts (
+            draft_id,
+            session_id,
+            asset_name,
+            asset_code,
+            direction,
+            amount,
+            price,
+            status,
+            slots_json,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft_id,
+            session_id,
+            asset_name,
+            asset_code,
+            direction,
+            amount,
+            price,
+            "negotiating",
+            json.dumps(slots, ensure_ascii=False),
+            iso(now),
+            iso(now),
+        ),
+    )
+
+    append_event(
+        conn,
+        session_id=session_id,
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type=ActionType.CREATE,
+        field=None,
+        old_value=None,
+        new_value=updates,
+        reasoning="create trade draft",
+    )
+
+    draft = get_draft(conn, draft_id)
+    assert draft is not None
+    return draft
+
+
+def update_draft_fields(
+    conn,
+    draft_id: str,
+    updates: Dict[str, Any],
+    message_id: Optional[str],
+    action_type: ActionType | str,
+    reasoning: Optional[str] = None,
+) -> List[str]:
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return []
+
+    updates = normalize_updates(updates)
+    slots = json.loads(row["slots_json"] or "{}")
+    now = utcnow()
+
+    action_name = (
+        action_type.value
+        if isinstance(action_type, ActionType)
+        else str(action_type)
+    )
+
+    slot_status = (
+        "confirmed"
+        if action_name == ActionType.CONFIRM.value
+        else "proposed"
+    )
+
+    changed_fields: List[str] = []
+
+    for field, value in updates.items():
+        if field not in ALLOWED_DRAFT_FIELDS:
+            continue
+
+        if value is None:
+            continue
+
+        old_value = row[field]
+
+        if old_value == value:
+            continue
+
+        conn.execute(
+            f"""
+            UPDATE trade_drafts
+            SET {field} = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (value, iso(now), draft_id),
+        )
+
+        slots[field] = SlotState(
+            value=value,
+            status=slot_status,
+            source_message_id=message_id,
+            updated_at=now,
+        ).model_dump(mode="json")
+
+        append_event(
+            conn,
+            session_id=row["session_id"],
+            draft_id=draft_id,
+            message_id=message_id,
+            action_type=action_name,
+            field=field,
+            old_value=old_value,
+            new_value=value,
+            reasoning=reasoning,
+        )
+
+        changed_fields.append(field)
+
+    if changed_fields:
+        conn.execute(
+            """
+            UPDATE trade_drafts
+            SET slots_json = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (
+                json.dumps(slots, ensure_ascii=False),
+                iso(now),
+                draft_id,
+            ),
+        )
+
+    return changed_fields
+
+
+def set_draft_status(
+    conn,
+    draft_id: str,
+    status: str,
+    message_id: Optional[str],
+    action_type: ActionType | str,
+    reasoning: Optional[str] = None,
+) -> None:
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return
+
+    old_status = row["status"]
+
+    if old_status == status:
+        return
+
+    now = utcnow()
+
+    conn.execute(
+        """
+        UPDATE trade_drafts
+        SET status = ?, updated_at = ?
+        WHERE draft_id = ?
+        """,
+        (status, iso(now), draft_id),
+    )
+
+    append_event(
+        conn,
+        session_id=row["session_id"],
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type=action_type,
+        field="status",
+        old_value=old_status,
+        new_value=status,
+        reasoning=reasoning,
+    )
+
+
+# ----------------------------
+# events
+# ----------------------------
+
+def append_event(
+    conn,
+    *,
+    session_id: str,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    action_type: ActionType | str,
+    field: Optional[str] = None,
+    old_value: Any = None,
+    new_value: Any = None,
+    reasoning: Optional[str] = None,
+) -> None:
+    event_id = new_id("evt")
+    now = utcnow()
+
+    action_name = (
+        action_type.value
+        if isinstance(action_type, ActionType)
+        else str(action_type)
+    )
+
+    conn.execute(
+        """
+        INSERT INTO draft_events (
+            event_id,
+            session_id,
+            draft_id,
+            message_id,
+            action_type,
+            field,
+            old_value,
+            new_value,
+            reasoning,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            session_id,
+            draft_id,
+            message_id,
+            action_name,
+            field,
+            to_json_value(old_value),
+            to_json_value(new_value),
+            reasoning,
+            iso(now),
+        ),
+    )
+
+
+def list_events(conn, session_id: str) -> List[DraftEvent]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM draft_events
+        WHERE session_id = ?
+        ORDER BY created_at ASC, rowid ASC
+        """,
+        (session_id,),
+    ).fetchall()
+
+    return [row_to_event(row) for row in rows]
+```
+
+---
+
+# 9. src/session_resolver.py
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .models import IncomingMessage, Session
+
+
+class SessionResolver(ABC):
+    """
+    SessionResolver 接口。
+
+    你后续可以替换成：
+    1. 基于时间窗口
+    2. 基于显式开始/结束
+    3. 基于业务单号
+    4. 基于模型判断
+    """
+
+    @abstractmethod
+    def conversation_key(self, message: IncomingMessage) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve(self, conn, message: IncomingMessage) -> Session:
+        raise NotImplementedError
+
+
+class DefaultSessionResolver(SessionResolver):
+    """
+    默认规则：
+
+    1. 如果有 group_id，则按群会话切分
+    2. 如果是私聊，则按 sender_id + receiver_id 切分
+    3. 在 SESSION_TIMEOUT_MINUTES 内有活跃 session，则复用
+    4. 否则创建新 session
+    """
+
+    def conversation_key(self, message: IncomingMessage) -> str:
+        if message.group_id:
+            return f"{message.channel}:group:{message.group_id}"
+
+        if message.receiver_id:
+            a, b = sorted([message.sender_id, message.receiver_id])
+            return f"{message.channel}:private:{a}:{b}"
+
+        return f"{message.channel}:private:{message.sender_id}"
+
+    def resolve(self, conn, message: IncomingMessage) -> Session:
+        key = self.conversation_key(message)
+
+        session = state_store.find_active_session(
+            conn,
+            conversation_key=key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        if session:
+            return session
+
+        return state_store.create_session(
+            conn,
+            conversation_key=key,
+            channel=message.channel,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+```
+
+---
+
+# 10. src/llm.py
+
+```python
+from __future__ import annotations
+
+import json
+import re
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+from .config import LLM_PROVIDER
+from .models import (
+    Action,
+    ActionTarget,
+    ActionType,
+    IncomingMessage,
+    LLMActionsResponse,
+    MessageRecord,
+    Session,
+    TradeDraft,
+)
+
+
+CREATE_WORDS = [
+    "新",
+    "另外",
+    "再开",
+    "再加",
+    "还有",
+    "增加一笔",
+    "新开",
+]
+
+REJECT_WORDS = [
+    "不要了",
+    "取消",
+    "不做了",
+    "拒绝",
+    "算了",
+]
+
+CONFIRM_WORDS = [
+    "确认",
+    "成交",
+    "done",
+    "ok",
+    "同意",
+    "没问题",
+]
+
+STOP_SUFFIXES = "有量吗呢吧啊的了么和与跟及，。！？、；,：:"
+
+
+class ActionExtractor(ABC):
+    """
+    增量动作抽取接口。
+
+    生产环境建议替换为真实 Qwen / OpenAI-compatible API。
+    """
+
+    @abstractmethod
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        raise NotImplementedError
+
+
+# ----------------------------
+# helpers
+# ----------------------------
+
+def _extract_asset_names(text: str) -> List[str]:
+    """
+    非常粗糙的 mock 资产名抽取。
+
+    仅用于演示，生产环境请交给 LLM。
+    """
+    raw = re.findall(
+        r"\d{1,2}[\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9]{1,20}",
+        text,
+    )
+
+    names: List[str] = []
+
+    for token in raw:
+        token = token.strip()
+
+        while token and token[-1] in STOP_SUFFIXES:
+            token = token[:-1]
+
+        if len(token) >= 3:
+            names.append(token)
+
+    seen = set()
+    result = []
+
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+
+    return result
+
+
+def _extract_amount(text: str) -> Optional[float]:
+    m = re.search(
+        r"(?:量|金额|面额|amount)[^\d]{0,10}?(\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1))
+
+    m = re.search(r"加到\s*(\d+(?:\.\d+)?)", text)
+    if m:
+        return float(m.group(1))
+
+    return None
+
+
+def _extract_price(text: str) -> Optional[float]:
+    m = re.search(
+        r"(?:价格|净价|全价|价)[^\d]{0,10}?(\d+(?:\.\d+)?)",
+        text,
+    )
+    if m:
+        return float(m.group(1))
+
+    if any(word in text for word in ["价格", "净价", "全价", "价"]):
+        m = re.search(r"(\d+\.\d{1,4})", text)
+        if m:
+            return float(m.group(1))
+
+    return None
+
+
+def _parse_ordinal(text: str) -> int:
+    if text.isdigit():
+        return int(text)
+
+    mapping = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    if text in mapping:
+        return mapping[text]
+
+    if "十" in text:
+        parts = text.split("十", 1)
+        left = parts[0]
+        right = parts[1]
+
+        left_value = mapping.get(left, 1) if left else 1
+        right_value = mapping.get(right, 0) if right else 0
+
+        return left_value * 10 + right_value
+
+    return 1
+
+
+def _name_exists(name: str, drafts: List[TradeDraft]) -> bool:
+    lower_name = name.lower()
+
+    for draft in drafts:
+        if not draft.asset_name:
+            continue
+
+        lower_existing = draft.asset_name.lower()
+
+        if lower_name in lower_existing or lower_existing in lower_name:
+            return True
+
+    return False
+
+
+def _build_target(
+    content: str,
+    drafts: List[TradeDraft],
+) -> Optional[ActionTarget]:
+    lowered = content.lower()
+
+    for draft in drafts:
+        if draft.asset_name and draft.asset_name.lower() in lowered:
+            return ActionTarget(
+                draft_id=draft.draft_id,
+                asset_name=draft.asset_name,
+            )
+
+        if draft.asset_code and draft.asset_code.lower() in lowered:
+            return ActionTarget(
+                draft_id=draft.draft_id,
+                asset_code=draft.asset_code,
+            )
+
+    if any(word in content for word in ["前者", "第一笔", "第1笔"]):
+        return ActionTarget(
+            reference_expression="前者",
+            ordinal=1,
+        )
+
+    if any(word in content for word in ["后者", "最后一笔", "最后的一笔", "第二笔", "第2笔"]):
+        return ActionTarget(
+            reference_expression="后者",
+            ordinal=2,
+        )
+
+    m = re.search(r"第([0-9一二两三四五六七八九十]+)笔", content)
+    if m:
+        ordinal = _parse_ordinal(m.group(1))
+        return ActionTarget(
+            reference_expression=m.group(0),
+            ordinal=ordinal,
+        )
+
+    if any(word in content for word in ["这笔", "当前这笔"]):
+        return ActionTarget(reference_expression="这笔")
+
+    if any(word in content for word in ["那笔"]):
+        return ActionTarget(reference_expression="那笔")
+
+    return None
+
+
+# ----------------------------
+# mock extractor
+# ----------------------------
+
+class MockActionExtractor(ActionExtractor):
+    """
+    本地规则 Mock。
+
+    仅用于开发联调。
+    生产环境请替换成真实 LLM。
+    """
+
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        content = message.content.strip()
+        content_lower = content.lower()
+
+        actions: List[Action] = []
+        clarify_question: Optional[str] = None
+
+        asset_names = _extract_asset_names(content)
+        new_names = [
+            name
+            for name in asset_names
+            if not _name_exists(name, drafts)
+        ]
+
+        names_to_create: List[str] = []
+
+        if not drafts and asset_names:
+            names_to_create = asset_names
+        elif new_names and any(word in content for word in CREATE_WORDS):
+            names_to_create = new_names
+
+        for name in names_to_create:
+            actions.append(
+                Action(
+                    action_type=ActionType.CREATE,
+                    target=ActionTarget(asset_name=name),
+                    updates={"asset_name": name},
+                    confidence=0.6,
+                    reasoning="mock: create trade draft",
+                )
+            )
+
+        target = _build_target(content, drafts)
+
+        updates = {}
+
+        amount = _extract_amount(content)
+        if amount is not None:
+            updates["amount"] = amount
+
+        price = _extract_price(content)
+        if price is not None:
+            updates["price"] = price
+
+        if any(word in content for word in REJECT_WORDS):
+            actions.append(
+                Action(
+                    action_type=ActionType.REJECT,
+                    target=target,
+                    confidence=0.7,
+                    reasoning="mock: reject/cancel",
+                )
+            )
+        elif any(word.lower() in content_lower for word in CONFIRM_WORDS):
+            actions.append(
+                Action(
+                    action_type=ActionType.CONFIRM,
+                    target=target,
+                    confidence=0.7,
+                    reasoning="mock: confirm",
+                )
+            )
+        elif updates:
+            actions.append(
+                Action(
+                    action_type=ActionType.UPDATE,
+                    target=target,
+                    updates=updates,
+                    confidence=0.7,
+                    reasoning="mock: update fields",
+                )
+            )
+        elif (
+            not actions
+            and len(drafts) > 1
+            and target is None
+            and ("?" in content or "？" in content or "哪" in content)
+        ):
+            clarify_question = "请问您指的是哪一笔？"
+
+        return LLMActionsResponse(
+            actions=actions,
+            clarify_question=clarify_question,
+        )
+
+
+# ----------------------------
+# qwen extractor placeholder
+# ----------------------------
+
+class QwenActionExtractor(ActionExtractor):
+    """
+    真实 Qwen 接入占位。
+
+    这里已经给你准备好了 Prompt。
+    你只需要把 Qwen API 返回的 JSON 解析成 LLMActionsResponse。
+    """
+
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        prompt = build_prompt(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        # TODO:
+        # 1. 调用 Qwen API
+        # 2. 要求模型严格输出 JSON
+        # 3. 解析为 LLMActionsResponse
+        #
+        # 示例：
+        # response = call_qwen_api(prompt)
+        # return LLMActionsResponse.model_validate_json(response)
+
+        raise NotImplementedError(
+            "QwenActionExtractor 尚未接入真实 API。"
+            "请先使用 LLM_PROVIDER=mock，或在 src/llm.py 中实现 Qwen 调用。\n"
+            f"Prompt preview:\n{prompt[:500]}..."
+        )
+
+
+def get_action_extractor() -> ActionExtractor:
+    provider = LLM_PROVIDER.lower()
+
+    if provider == "mock":
+        return MockActionExtractor()
+
+    if provider == "qwen":
+        return QwenActionExtractor()
+
+    raise ValueError(f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}")
+
+
+# ----------------------------
+# prompt
+# ----------------------------
+
+def build_prompt(
+    *,
+    session: Session,
+    drafts: List[TradeDraft],
+    history: List[MessageRecord],
+    message: IncomingMessage,
+) -> str:
+    drafts_payload = [
+        {
+            "draft_id": draft.draft_id,
+            "asset_name": draft.asset_name,
+            "asset_code": draft.asset_code,
+            "direction": draft.direction,
+            "amount": draft.amount,
+            "price": draft.price,
+            "status": draft.status,
+        }
+        for draft in drafts
+    ]
+
+    history_payload = [
+        {
+            "sender_id": item.sender_id,
+            "content": item.content,
+            "ts": str(item.ts),
+        }
+        for item in history[-10:]
+    ]
+
+    payload = {
+        "session": {
+            "session_id": session.session_id,
+            "status": session.status,
+        },
+        "current_drafts": drafts_payload,
+        "recent_history": history_payload,
+        "latest_message": {
+            "sender_id": message.sender_id,
+            "content": message.content,
+        },
+    }
+
+    return f"""
+# Role
+你是一个银行间市场交易对话状态追踪助手。
+
+# Task
+请根据【当前交易草稿状态】、【近期对话历史】和【最新一条消息】，分析最新消息带来了哪些增量状态变化。
+
+# Rules
+1. 你不要输出完整状态，只输出增量操作指令。
+2. 支持动作：CREATE / UPDATE / CONFIRM / REJECT / CANCEL / CLARIFY / NOOP。
+3. 如果能定位到具体 draft，请尽量输出 draft_id。
+4. 如果用户使用“前者、后者、这笔、那笔、第一笔、第二笔”等指代，请结合当前草稿列表和近期历史判断。
+5. 如果无法定位或信息不足，请输出 CLARIFY。
+6. 严格输出 JSON，不要输出解释文本。
+
+# Output Schema
+{{
+  "actions": [
+    {{
+      "action_type": "UPDATE",
+      "target": {{
+        "draft_id": "draft_xxx",
+        "asset_name": "24长发",
+        "reference_expression": "前者",
+        "ordinal": 1
+      }},
+      "updates": {{
+        "amount": 2000,
+        "price": 100.88
+      }},
+      "confidence": 0.93,
+      "reasoning": "用户说前者量加到2000"
+    }}
+  ],
+  "clarify_question": null
+}}
+
+# Input
+{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}
+""".strip()
+```
+
+---
+
+# 11. src/service.py
+
+```python
+from __future__ import annotations
+
+from typing import List, Optional
+
+from . import state_store
+from .db import get_db
+from .llm import ActionExtractor
+from .models import (
+    Action,
+    ActionTarget,
+    ActionType,
+    IncomingMessage,
+    ProcessResult,
+    TradeDraft,
+)
+from .session_resolver import SessionResolver
+
+
+def resolve_target(
+    drafts: List[TradeDraft],
+    target: Optional[ActionTarget],
+) -> Optional[TradeDraft]:
+    if not drafts:
+        return None
+
+    if target:
+        if target.draft_id:
+            for draft in drafts:
+                if draft.draft_id == target.draft_id:
+                    return draft
+
+        if target.asset_name:
+            lower_target = target.asset_name.lower()
+            for draft in drafts:
+                if not draft.asset_name:
+                    continue
+
+                lower_name = draft.asset_name.lower()
+                if lower_target in lower_name or lower_name in lower_target:
+                    return draft
+
+        if target.asset_code:
+            lower_code = target.asset_code.lower()
+            for draft in drafts:
+                if draft.asset_code and draft.asset_code.lower() == lower_code:
+                    return draft
+
+        if target.ordinal is not None:
+            index = target.ordinal - 1
+            if 0 <= index < len(drafts):
+                return drafts[index]
+
+        if target.reference_expression:
+            ref = target.reference_expression.lower()
+
+            if any(word in ref for word in ["前者", "第一", "第1", "first"]):
+                return drafts[0]
+
+            if any(word in ref for word in ["后者", "最后", "last"]):
+                return drafts[-1]
+
+            if any(word in ref for word in ["这笔", "当前"]):
+                return drafts[-1]
+
+            if any(word in ref for word in ["那笔"]):
+                return drafts[0]
+
+    return None
+
+
+def _get_lookup_target(action: Action) -> ActionTarget:
+    target = action.target.model_copy() if action.target else ActionTarget()
+
+    if action.updates:
+        if not target.asset_name and action.updates.get("asset_name"):
+            target.asset_name = action.updates["asset_name"]
+
+        if not target.asset_code and action.updates.get("asset_code"):
+            target.asset_code = action.updates["asset_code"]
+
+    return target
+
+
+def apply_action(
+    conn,
+    *,
+    session_id: str,
+    drafts: List[TradeDraft],
+    action: Action,
+    message_id: str,
+) -> Optional[str]:
+    """
+    返回 clarify_question。
+    如果没有需要反问，则返回 None。
+    """
+
+    lookup_target = _get_lookup_target(action)
+
+    if action.action_type == ActionType.CREATE:
+        updates = dict(action.updates or {})
+
+        if lookup_target.asset_name and not updates.get("asset_name"):
+            updates["asset_name"] = lookup_target.asset_name
+
+        if lookup_target.asset_code and not updates.get("asset_code"):
+            updates["asset_code"] = lookup_target.asset_code
+
+        existing = resolve_target(drafts, lookup_target)
+
+        if existing:
+            state_store.update_draft_fields(
+                conn,
+                draft_id=existing.draft_id,
+                updates=updates,
+                message_id=message_id,
+                action_type=ActionType.UPDATE,
+                reasoning=action.reasoning,
+            )
+        else:
+            state_store.create_draft(
+                conn,
+                session_id=session_id,
+                updates=updates,
+                message_id=message_id,
+            )
+
+        return None
+
+    if action.action_type == ActionType.UPDATE:
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            clarify = "无法定位要更新的交易草稿，请补充标的或指代。"
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=clarify,
+                reasoning=action.reasoning,
+            )
+            return clarify
+
+        if target_draft.status == "confirmed":
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=target_draft.draft_id,
+                message_id=message_id,
+                action_type=ActionType.NOOP,
+                field=None,
+                old_value=None,
+                new_value="draft already confirmed",
+                reasoning="已确认交易默认不允许直接修改",
+            )
+            return None
+
+        state_store.update_draft_fields(
+            conn,
+            draft_id=target_draft.draft_id,
+            updates=action.updates,
+            message_id=message_id,
+            action_type=action.action_type,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    if action.action_type in (
+        ActionType.CONFIRM,
+        ActionType.REJECT,
+        ActionType.CANCEL,
+    ):
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            clarify = "无法定位要确认/取消的交易草稿，请补充标的或指代。"
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=clarify,
+                reasoning=action.reasoning,
+            )
+            return clarify
+
+        status_map = {
+            ActionType.CONFIRM: "confirmed",
+            ActionType.REJECT: "rejected",
+            ActionType.CANCEL: "cancelled",
+        }
+
+        state_store.set_draft_status(
+            conn,
+            draft_id=target_draft.draft_id,
+            status=status_map[action.action_type],
+            message_id=message_id,
+            action_type=action.action_type,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    if action.action_type == ActionType.CLARIFY:
+        clarify = action.reasoning or "请补充信息。"
+        state_store.append_event(
+            conn,
+            session_id=session_id,
+            draft_id=None,
+            message_id=message_id,
+            action_type=ActionType.CLARIFY,
+            field=None,
+            old_value=None,
+            new_value=clarify,
+            reasoning=action.reasoning,
+        )
+        return clarify
+
+    if action.action_type == ActionType.NOOP:
+        state_store.append_event(
+            conn,
+            session_id=session_id,
+            draft_id=None,
+            message_id=message_id,
+            action_type=ActionType.NOOP,
+            field=None,
+            old_value=None,
+            new_value=None,
+            reasoning=action.reasoning,
+        )
+        return None
+
+    return None
+
+
+def process_message(
+    message: IncomingMessage,
+    resolver: SessionResolver,
+    extractor: ActionExtractor,
+) -> ProcessResult:
+    with get_db() as conn:
+        session = resolver.resolve(conn, message)
+
+        message_id = state_store.upsert_message(
+            conn,
+            message=message,
+            session_id=session.session_id,
+        )
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+        history = state_store.list_recent_messages(
+            conn,
+            session_id=session.session_id,
+            limit=20,
+        )
+
+        llm_result = extractor.extract(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        clarify_question = llm_result.clarify_question
+
+        for action in llm_result.actions:
+            local_clarify = apply_action(
+                conn,
+                session_id=session.session_id,
+                drafts=drafts,
+                action=action,
+                message_id=message_id,
+            )
+
+            if local_clarify and not clarify_question:
+                clarify_question = local_clarify
+
+            # 如果发生 CREATE，后续 action 需要看到最新 drafts
+            drafts = state_store.list_drafts(conn, session.session_id)
+
+        if llm_result.clarify_question:
+            state_store.append_event(
+                conn,
+                session_id=session.session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=llm_result.clarify_question,
+                reasoning="llm clarify",
+            )
+
+        state_store.touch_session(conn, session.session_id)
+
+        session = state_store.get_session(conn, session.session_id)
+        assert session is not None
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+
+        return ProcessResult(
+            session=session,
+            drafts=drafts,
+            actions=llm_result.actions,
+            clarify_question=clarify_question,
+            message_id=message_id,
+        )
+```
+
+---
+
+# 12. src/api.py
+
+```python
+from __future__ import annotations
+
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .db import get_db
+from .llm import ActionExtractor, get_action_extractor
+from .models import (
+    DraftEvent,
+    IncomingMessage,
+    ProcessResult,
+    SessionDetail,
+    SessionResolveResult,
+    TradeDraft,
+)
+from .service import process_message
+from .session_resolver import DefaultSessionResolver, SessionResolver
+
+router = APIRouter(prefix="/api")
+
+
+def get_session_resolver() -> SessionResolver:
+    """
+    这里可以替换成自定义 SessionResolver。
+    """
+    return DefaultSessionResolver()
+
+
+def get_extractor() -> ActionExtractor:
+    return get_action_extractor()
+
+
+@router.post("/messages", response_model=ProcessResult)
+def api_process_message(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+    extractor: ActionExtractor = Depends(get_extractor),
+):
+    """
+    核心接口：接收一条新消息，执行增量状态更新。
+    """
+    return process_message(
+        message=payload,
+        resolver=resolver,
+        extractor=extractor,
+    )
+
+
+@router.post("/session-resolver/resolve", response_model=SessionResolveResult)
+def api_resolve_session(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+):
+    """
+    SessionResolver 调试接口。
+
+    前端仍然可以不传 session_id。
+    这个接口用于查看某条消息会被分配到哪个 session。
+    """
+    with get_db() as conn:
+        conversation_key = resolver.conversation_key(payload)
+
+        existing = state_store.find_active_session(
+            conn,
+            conversation_key=conversation_key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        session = resolver.resolve(conn, payload)
+
+        return SessionResolveResult(
+            session_id=session.session_id,
+            conversation_key=conversation_key,
+            created=existing is None,
+            session=session,
+        )
+
+
+@router.get("/sessions/{session_id}", response_model=SessionDetail)
+def api_get_session(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        drafts = state_store.list_drafts(conn, session_id)
+        messages = state_store.list_recent_messages(
+            conn,
+            session_id=session_id,
+            limit=100,
+        )
+
+        return SessionDetail(
+            session=session,
+            drafts=drafts,
+            messages=messages,
+        )
+
+
+@router.get("/sessions/{session_id}/drafts", response_model=List[TradeDraft])
+def api_get_session_drafts(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        return state_store.list_drafts(conn, session_id)
+
+
+@router.get("/sessions/{session_id}/events", response_model=List[DraftEvent])
+def api_get_session_events(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        return state_store.list_events(conn, session_id)
+```
+
+---
+
+# 13. main.py
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src.api import router
+from src.db import init_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Trade Dialogue DST",
+    description="多轮交易对话状态追踪与增量 NER 服务",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+app.include_router(router, tags=["dst"])
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+```
+
+---
+
+# 14. README.md
+
+```markdown
+# Trade Dialogue DST
+
+多轮交易对话状态追踪与增量 NER 服务。
+
+## 功能
+
+- 前端不传 session_id
+- 后端自动解析 / 创建 / 复用 session
+- SQLite 落盘
+- 增量 Actions 更新 trade_draft
+- 记录状态变更事件
+
+## 启动
+
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+## 示例
+
+### 1. 第一条消息
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_A",
+    "receiver_id": "trader_B",
+    "channel": "qq",
+    "content": "24长发和25诚通有量吗？"
+  }'
+```
+
+### 2. 更新前者量
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_A",
+    "receiver_id": "trader_B",
+    "channel": "qq",
+    "content": "前者量加到2000"
+  }'
+```
+
+### 3. 更新后者价格
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_B",
+    "receiver_id": "trader_A",
+    "channel": "qq",
+    "content": "后者价格100.36"
+  }'
+```
+
+### 4. 确认前者
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_A",
+    "receiver_id": "trader_B",
+    "channel": "qq",
+    "content": "前者确认"
+  }'
+```
+
+## 查看 session
+
+将返回中的 `session.session_id` 替换进去：
+
+```bash
+curl http://127.0.0.1:8000/api/sessions/{session_id}
+```
+
+## 数据库
+
+默认 SQLite 文件：
+
+```text
+data/app.db
+```
+
+## 接入真实 Qwen
+
+默认：
+
+```text
+LLM_PROVIDER=mock
+```
+
+如果要接入真实 Qwen：
+
+1. 设置：
+
+```bash
+export LLM_PROVIDER=qwen
+```
+
+2. 在 `src/llm.py` 中实现：
+
+```python
+class QwenActionExtractor(ActionExtractor):
+    def extract(...):
+        prompt = build_prompt(...)
+        # call Qwen API
+        # parse JSON
+        # return LLMActionsResponse
+```
+
+建议要求模型严格输出：
+
+```json
+{
+  "actions": [],
+  "clarify_question": null
+}
+```
+```
+
+---
+
+# 15. 这套代码的运行逻辑
+
+一次消息处理流程如下：
+
+```text
+POST /api/messages
+        |
+        v
+SessionResolver.resolve()
+        |
+        v
+找到或创建 session
+        |
+        v
+消息落盘 messages
+        |
+        v
+读取当前 session 的 trade_drafts
+        |
+        v
+读取最近 history
+        |
+        v
+ActionExtractor.extract()
+        |
+        v
+得到 Actions
+        |
+        v
+apply_action()
+        |
+        v
+更新 trade_drafts
+        |
+        v
+写入 draft_events
+        |
+        v
+返回最新 session + drafts
+```
+
+---
+
+# 16. 你后续接真实 Qwen 时，只需要改哪里？
+
+核心只改一个地方：
+
+```text
+src/llm.py
+```
+
+你现在代码里已经预留了：
+
+```python
+class QwenActionExtractor(ActionExtractor):
+    def extract(...):
+        prompt = build_prompt(...)
+        raise NotImplementedError
+```
+
+你只需要把它改成：
+
+```python
+response_text = call_qwen_api(prompt)
+return LLMActionsResponse.model_validate_json(response_text)
+```
+
+其他部分不用大改。
+
+---
+
+# 17. 生产化建议
+
+这份代码是**可运行的骨架**，如果你要上生产，建议继续补这几块：
+
+1. **真实 Qwen 输出 JSON 的鲁棒解析**
+   - 模型可能带 ```json
+   - 可能输出解释文本
+   - 需要做 JSON 清洗
+
+2. **置信度控制**
+   - `confidence < threshold` 时不要直接更新
+   - 转为 `CLARIFY`
+
+3. **字段级确认状态**
+   - `proposed`
+   - `confirmed`
+   - `rejected`
+   - `ambiguous`
+
+4. **成单快照**
+   - 当某个 `trade_draft.status == confirmed`
+   - 生成一条 `final_trade_snapshot`
+   - 推给下游 OMS / EMS
+
+5. **反馈闭环**
+   - 增加 `/api/feedback`
+   - 关联 `session_id`、`draft_id`、`message_id`
+   - 用于后续 prompt/few-shot/模型评估优化
+
+6. **更复杂的 Session 切分**
+   - 当前默认按聊天对象 + 超时时间
+   - 后续可以加入显式开始/结束、交易日期、业务单号等规则
+
+如果你愿意，我下一步可以继续帮你补一版：
+
+1. **接入真实 Qwen API 的完整 `QwenActionExtractor`**
+2. **带 JSON 修复、重试、结构化输出校验的版本**
+3. **增加反馈接口 `/api/feedback` 的完整闭环版本**
+
