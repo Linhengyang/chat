@@ -256,3 +256,1367 @@
 
 这种架构不仅完美契合 Qwen 等现代大模型的能力边界（擅长理解和生成，但不擅长在长文本中维持精确的 JSON 状态），而且工程可控性极强，是目前业界做 Conversational AI 的主流最佳实践。
 
+
+---
+🙋**user**:
+---
+```
+我消化一下：
+1. 建立状态机。状态储存在redis或本地sqlite db里。存储的维度是session_id-trade_draft-slot
+2. 增量更新方案。LLM作为处理机，每次有最新消息进来时，执行 读取该session当前所有trade_draft状态、该session近期对话历史、最新消息，输出结构化的操作指令Actions
+3. Actions要包括对涉及的每一条trade_draft的定位id、动作、字段值和理由等。根据Actions定位到对应trade_draft, 再去去更新对应的存储状态
+我有如下问题：
+1. 目前系统接收的会话，会是连续不断的消息记录(with发送人id)。你说前端请求要带session_id, 想问下这怎么带？
+2. 就目前的架构，我没看到session_id起到的作用: 定位靠trade_draft，填充的是slot。session_id仅是trade_draft的集合，没看到起作用的点
+```
+
+---
+🤖**assistant**:
+---
+
+你消化的方向是对的，但我建议你把 `session_id` 从“trade_draft 的集合”这个理解，升级成：
+
+> **session 是一次“交易协商上下文”的边界。**  
+> 它不是简单地把多个 trade_draft 放在一起，而是决定了：  
+> “当前这句话属于哪一场谈判、能看见哪些候选交易草稿、允许更新哪些字段、什么时候结束、成单后归属哪次协商。”
+
+你的两个问题非常关键，下面分别展开。
+
+---
+
+# 一、如果系统现在只接收连续消息记录，`session_id` 怎么带？
+
+你不一定要求前端天然传一个标准 `session_id`。更现实的做法是：
+
+> **前端或上游消息系统能带就带；不能带，就在你的服务入口做 Session Resolver，由后端推断。**
+
+也就是说，`session_id` 可以不是前端传的，而是你的 NER 服务自己“算出来”的。
+
+---
+
+## 1. 最理想情况：上游本来就有会话概念
+
+如果你们的聊天系统里有下面任何一种 ID，都可以直接映射成 `session_id` 或生成 `session_id` 的基础：
+
+| 上游已有概念 | 可映射为什么 |
+|---|---|
+| 私聊窗口 | `conversation_id` |
+| 群聊 / 交易群 | `conversation_id` 或 `room_id` |
+| 消息线程 / 引用回复 | `thread_id` |
+| 某个交易请求单 | `deal_request_id` |
+| 某个机器人任务 | `task_id` |
+| 交易员之间的一次询价 | `inquiry_id` |
+
+比如消息可以长这样：
+
+```json
+{
+  "message_id": "msg_1001",
+  "sender_id": "trader_A",
+  "receiver_id": "trader_B",
+  "channel": "qq",
+  "conversation_id": "conv_8899",
+  "content": "24长发和25诚通有量吗？",
+  "ts": 1730000000
+}
+```
+
+你可以先定义：
+
+```text
+conversation_id = 通信层会话
+session_id = 业务层交易协商会话
+```
+
+第一版可以简单粗暴：
+
+```text
+session_id = conversation_id + 时间窗口
+```
+
+例如：
+
+```text
+session_id = conv_8899:20260622:active
+```
+
+或者：
+
+```text
+session_id = conv_8899:session_0001
+```
+
+---
+
+## 2. 如果上游没有明确会话，只有一条连续消息流怎么办？
+
+这是你描述的情况：
+
+> 系统接收的是连续不断的消息记录，只有发送人 ID、内容、时间等。
+
+那就需要在你的服务入口加一层：
+
+> **Session Resolver：会话切分器。**
+
+它的任务是：  
+每来一条新消息，判断这条消息属于哪个 `session`。
+
+---
+
+## 3. Session Resolver 的最简规则
+
+你可以先从简单规则开始，不需要一上来做很复杂。
+
+### 方案 A：按“通信对象 + 时间窗口”切分
+
+例如：
+
+```text
+conversation_key = sender_id + receiver_id
+```
+
+或者如果是群聊：
+
+```text
+conversation_key = group_id
+```
+
+然后：
+
+```text
+如果 conversation_key 当前有活跃 session，并且最近 30 分钟内有消息：
+    归入当前 session
+否则：
+    创建新 session
+```
+
+示例：
+
+```text
+10:00 A: 24长发有量吗？
+10:01 B: 100.8 有 2000
+10:02 A: 价格再看看
+10:03 B: 100.75 可以
+
+10:45 A: 另外问一笔 25诚通
+```
+
+如果空闲阈值是 30 分钟，那么 10:45 这条可能会开启新 session。
+
+---
+
+### 方案 B：按“交易日 + 通信对象”切分
+
+金融交易场景里，很多时候可以按交易日切：
+
+```text
+session_id = trader_pair + trading_day
+```
+
+例如：
+
+```text
+A_B_20260622_session
+```
+
+这种方式简单稳定，适合交易员一天内围绕若干笔交易持续沟通。
+
+---
+
+### 方案 C：按“显式开始 / 结束”切分
+
+如果业务上允许，最好有显式信号：
+
+```text
+开始：新需求 / 帮我开一笔 / 开始谈这个
+结束：先这样 / 不做了 / 成交 / 取消 / 结束
+```
+
+例如：
+
+```text
+A: 我们聊一下 24长发
+```
+
+创建新 session。
+
+```text
+A: 这笔先不做了
+```
+
+关闭当前 session。
+
+```text
+A: OK done
+```
+
+把对应 trade_draft 标记 confirmed，并可能关闭整个 session。
+
+---
+
+### 方案 D：按“消息主题 / 标的”切分
+
+当消息里出现新标的时，可以选择：
+
+1. 在当前 session 里新增一个 `trade_draft`；
+2. 或者开启一个新的 `session`。
+
+对于你现在这个场景：
+
+> 询问方可能同时询问两条交易的具体信息，然后回答方回复，双方逐步在聊天中补齐所有字段。
+
+我更建议：
+
+> **同一个 session 内允许多个 trade_draft。**
+
+因为用户经常会说：
+
+```text
+前者 2000
+后者不要了
+两笔价格都行
+刚才第二笔量改一下
+```
+
+这些表达需要共享上下文。如果把两笔交易拆成两个 session，反而不好处理“前者、后者、两笔都”这种说法。
+
+---
+
+## 4. 推荐的第一版做法
+
+如果你们现在只有连续消息流，我建议第一版这样设计：
+
+### 输入消息
+
+```json
+{
+  "message_id": "msg_001",
+  "sender_id": "user_123",
+  "receiver_id": "user_456",
+  "group_id": null,
+  "content": "前者量加到2000",
+  "ts": 1730000000
+}
+```
+
+### 后端生成 `conversation_key`
+
+如果是私聊：
+
+```python
+conversation_key = f"private:{min(sender_id, receiver_id)}:{max(sender_id, receiver_id)}"
+```
+
+如果是群聊：
+
+```python
+conversation_key = f"group:{group_id}"
+```
+
+### 查找活跃 session
+
+Redis 里可以存：
+
+```text
+dst:conv:{conversation_key}:active_session
+```
+
+例如：
+
+```text
+dst:conv:group:8899:active_session = session_20260622_0001
+```
+
+### 如果不存在或过期，则创建新 session
+
+```python
+session_id = create_session(conversation_key, message)
+```
+
+然后写回：
+
+```python
+redis.set(
+    f"dst:conv:{conversation_key}:active_session",
+    session_id,
+    ex=3600
+)
+```
+
+### 如果存在，则继续用当前 session
+
+```python
+session_id = redis.get(f"dst:conv:{conversation_key}:active_session")
+```
+
+---
+
+## 5. 前端到底要不要传？
+
+可以分阶段。
+
+### 第一阶段：前端不传也可以
+
+你的服务接受原始消息：
+
+```json
+{
+  "sender_id": "user_123",
+  "receiver_id": "user_456",
+  "content": "24长发 100.8 有量吗？",
+  "ts": 1730000000
+}
+```
+
+后端自己算：
+
+```json
+{
+  "conversation_key": "private:user_123:user_456",
+  "session_id": "session_20260622_0001"
+}
+```
+
+这是最容易落地的。
+
+---
+
+### 第二阶段：前端或上游传一个 `conversation_id`
+
+比如：
+
+```json
+{
+  "conversation_id": "conv_8899",
+  "sender_id": "user_123",
+  "content": "前者量加到2000"
+}
+```
+
+后端基于：
+
+```text
+conversation_id + 时间窗口
+```
+
+生成或查找 `session_id`。
+
+---
+
+### 第三阶段：前端显式传 `session_id`
+
+如果前端有交易协商卡片、任务窗口、聊天面板，那么前端可以直接传：
+
+```json
+{
+  "session_id": "session_20260622_0001",
+  "content": "这笔确认"
+}
+```
+
+这时后端最省心。
+
+---
+
+# 二、`session_id` 到底起什么作用？
+
+你说：
+
+> 定位靠 trade_draft，填充的是 slot。session_id 仅是 trade_draft 的集合，没看到起作用的点。
+
+这个理解需要修正一下。
+
+更准确地说：
+
+```text
+session_id 决定“候选上下文范围”；
+trade_draft 决定“具体交易对象”；
+slot 决定“交易字段值”。
+```
+
+`session_id` 的作用不是直接定位字段，而是解决下面这些关键问题。
+
+---
+
+# 1. 没有 `session`，模型不知道“当前有哪些候选交易”
+
+你说定位靠 `trade_draft`，这没错。
+
+但问题是：
+
+> 模型怎么知道应该定位到哪一个 `trade_draft`？
+
+比如用户说：
+
+```text
+前者量加到2000
+```
+
+模型必须知道：
+
+1. 当前 session 里有哪些 `trade_draft`；
+2. 它们的顺序是什么；
+3. 它们的名称 / 代码 / 别名是什么；
+4. 哪一个最近被提到；
+5. 哪一个是“前者”。
+
+这些信息来自当前 `session` 的状态。
+
+如果没有 `session`，模型要么看不到上下文，要么只能看到全局所有历史交易草稿。全局历史会非常混乱。
+
+例如系统里历史上有很多交易：
+
+```text
+draft_001: 24长发
+draft_002: 25诚通
+draft_003: 23城投
+draft_004: 24长发
+draft_005: 25诚通
+...
+```
+
+用户现在说：
+
+```text
+前者可以
+```
+
+如果没有当前 session 范围，模型根本不知道是哪一个“前者”。
+
+---
+
+# 2. `session` 是多笔交易并行时的“谈判桌”
+
+你可以把 `session` 理解成一张谈判桌。
+
+例如：
+
+```text
+session_001 谈判桌上有：
+  draft_1: 24长发
+  draft_2: 25诚通
+```
+
+用户说：
+
+```text
+两笔都是1000吗？
+```
+
+模型知道它是在问这张谈判桌上的两个 draft。
+
+如果没有 `session`，系统可能会把这句话关联到别的谈判桌上的交易。
+
+所以：
+
+```text
+session 不是 trade_draft 的简单集合；
+session 是“当前正在协商的一组交易草稿及其上下文”。
+```
+
+---
+
+# 3. `session` 解决指代消解问题
+
+多轮聊天里最难的是指代：
+
+```text
+前者
+后者
+这笔
+那笔
+刚才那个
+第二笔
+长发那笔
+诚通那个
+你刚报的那个
+```
+
+这些词本身不包含完整实体信息。
+
+模型需要结合：
+
+```text
+当前 session 内的近期消息 + 当前 session 内的 trade_draft 列表
+```
+
+才能推断：
+
+```text
+前者 = draft_1
+后者 = draft_2
+```
+
+如果没有 `session`，这些指代没有锚点。
+
+---
+
+# 4. `session` 决定状态生命周期
+
+交易协商是有生命周期的。
+
+比如一个 `session` 可以有状态：
+
+```text
+active       活跃中
+negotiating  谈判中
+confirmed    已确认
+cancelled    已取消
+expired      已过期
+closed       已关闭
+```
+
+如果没有 `session`，你很难判断一句话是否还能更新某个交易。
+
+例如：
+
+```text
+10:00 A: 24长发 100.8 可以吗？
+10:01 B: 可以
+10:02 A: done
+```
+
+这时应该关闭或确认相关交易。
+
+之后 11:00 又来一句：
+
+```text
+价格再改一下
+```
+
+如果没有 `session`，系统不知道这句是不是还能更新刚才那笔已确认交易。
+
+如果有 `session`，你可以判断：
+
+```text
+当前 session 已关闭 / 已确认
+这句话不能直接更新原交易，而是需要新建协商或触发人工确认
+```
+
+---
+
+# 5. `session` 控制 LLM 上下文成本
+
+如果你没有 `session`，每次模型要理解当前消息，可能需要加载：
+
+```text
+所有历史交易草稿
+所有历史消息
+所有用户聊天
+```
+
+这会带来三个问题：
+
+1. Token 成本高；
+2. 上下文太长；
+3. 模型容易被无关历史干扰。
+
+有了 `session`，你只需要喂：
+
+```text
+当前 session 的 drafts
+当前 session 最近 N 条消息
+最新消息
+```
+
+例如：
+
+```json
+{
+  "current_drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "price": 100.85,
+      "amount": null
+    },
+    {
+      "draft_id": "draft_2",
+      "asset_name": "25诚通",
+      "price": 100.36,
+      "amount": 1000
+    }
+  ],
+  "recent_history": [
+    "A: 24长发和25诚通有量吗？",
+    "B: 长发100.85，诚通100.36",
+    "A: 前者量加到2000"
+  ]
+}
+```
+
+这样模型更稳，成本也低。
+
+---
+
+# 6. `session` 是审计和反馈的归属单位
+
+后续你一定会遇到这些问题：
+
+```text
+这笔交易为什么识别成这样？
+模型哪一句话理解错了？
+当时上下文是什么？
+用户纠错的是哪一轮状态？
+成单结果对应哪段聊天？
+```
+
+如果没有 `session`，你很难复盘。
+
+有了 `session`，你可以把以下内容串起来：
+
+```text
+消息
+模型输出
+状态变更
+用户纠错
+最终成单
+反馈记录
+```
+
+例如：
+
+```text
+session_id = session_001
+message_id = msg_123
+draft_id = draft_1
+field = amount
+old_value = 1000
+new_value = 2000
+reason = 用户说“前者量加到2000”
+```
+
+这会非常有用。
+
+---
+
+# 三、推荐的数据模型
+
+你可以把模型设计成四层：
+
+```text
+Message 层：原始消息
+Session 层：协商上下文
+TradeDraft 层：交易草稿
+Slot / Field 层：字段状态
+Event 层：状态变更事件
+```
+
+---
+
+## 1. Session 表
+
+```sql
+CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY,
+    conversation_key TEXT,
+    channel TEXT,
+    status TEXT,
+    started_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    expired_at TIMESTAMP
+);
+```
+
+示例：
+
+```json
+{
+  "session_id": "session_001",
+  "conversation_key": "group_8899",
+  "channel": "qq",
+  "status": "negotiating",
+  "started_at": "2026-06-22 10:00:00",
+  "updated_at": "2026-06-22 10:05:00"
+}
+```
+
+---
+
+## 2. Message 表
+
+```sql
+CREATE TABLE messages (
+    message_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    sender_id TEXT,
+    content TEXT,
+    ts TIMESTAMP
+);
+```
+
+示例：
+
+```json
+{
+  "message_id": "msg_1001",
+  "session_id": "session_001",
+  "sender_id": "trader_A",
+  "content": "前者量加到2000",
+  "ts": "2026-06-22 10:05:00"
+}
+```
+
+---
+
+## 3. TradeDraft 表
+
+```sql
+CREATE TABLE trade_drafts (
+    draft_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    asset_name TEXT,
+    asset_code TEXT,
+    direction TEXT,
+    amount REAL,
+    price REAL,
+    status TEXT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+```
+
+示例：
+
+```json
+{
+  "draft_id": "draft_1",
+  "session_id": "session_001",
+  "asset_name": "24长发",
+  "asset_code": null,
+  "direction": "bid",
+  "amount": 2000,
+  "price": 100.85,
+  "status": "negotiating"
+}
+```
+
+---
+
+## 4. Slot 状态
+
+你可以一开始不用单独建 slot 表，而是把字段状态放进 JSON。
+
+例如：
+
+```json
+{
+  "draft_id": "draft_1",
+  "slots": {
+    "asset_name": {
+      "value": "24长发",
+      "status": "confirmed",
+      "source_message_id": "msg_1000"
+    },
+    "price": {
+      "value": 100.85,
+      "status": "proposed",
+      "source_message_id": "msg_1001"
+    },
+    "amount": {
+      "value": 2000,
+      "status": "proposed",
+      "source_message_id": "msg_1005"
+    }
+  }
+}
+```
+
+这里我建议每个字段不要只存值，而是存：
+
+```json
+{
+  "value": 100.85,
+  "status": "proposed",
+  "source_message_id": "msg_1001",
+  "confidence": 0.92
+}
+```
+
+因为在交易场景里：
+
+```text
+提到 ≠ 确认
+报价 ≠ 成交
+修改 ≠ 最终确认
+```
+
+字段状态可以是：
+
+```text
+missing     缺失
+proposed    已提出
+confirmed   已确认
+rejected    已拒绝
+ambiguous   有歧义
+```
+
+---
+
+## 5. Event 表，非常重要
+
+强烈建议加一个状态变更事件表：
+
+```sql
+CREATE TABLE draft_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    draft_id TEXT,
+    message_id TEXT,
+    action_type TEXT,
+    field TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    reasoning TEXT,
+    created_at TIMESTAMP
+);
+```
+
+示例：
+
+```json
+{
+  "event_id": "evt_001",
+  "session_id": "session_001",
+  "draft_id": "draft_1",
+  "message_id": "msg_1005",
+  "action_type": "UPDATE",
+  "field": "amount",
+  "old_value": 1000,
+  "new_value": 2000,
+  "reasoning": "用户说前者量加到2000，根据上下文前者指24长发"
+}
+```
+
+这个表的价值很大：
+
+1. 可审计；
+2. 可回滚；
+3. 可做 feedback；
+4. 可分析模型错误；
+5. 可解释为什么状态变成这样。
+
+---
+
+# 四、你现在的架构应该怎么跑？
+
+可以抽象成下面这个流程。
+
+---
+
+## 1. 消息进入
+
+```json
+{
+  "message_id": "msg_1005",
+  "sender_id": "user_A",
+  "receiver_id": "user_B",
+  "content": "前者量加到2000",
+  "ts": 1730000000
+}
+```
+
+---
+
+## 2. Session Resolver
+
+```python
+conversation_key = resolve_conversation_key(message)
+session_id = get_active_session(conversation_key)
+
+if not session_id or is_expired(session_id):
+    session_id = create_session(conversation_key, message)
+```
+
+---
+
+## 3. 加载当前状态
+
+```python
+session = load_session(session_id)
+drafts = load_drafts(session_id)
+history = load_recent_messages(session_id, limit=10)
+```
+
+---
+
+## 4. 调用 LLM 做增量理解
+
+给 Qwen 的输入大概是：
+
+```json
+{
+  "current_drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "price": 100.85,
+      "amount": 1000
+    },
+    {
+      "draft_id": "draft_2",
+      "asset_name": "25诚通",
+      "price": 100.36,
+      "amount": 1000
+    }
+  ],
+  "recent_history": [
+    "A: 24长发和25诚通有量吗？",
+    "B: 长发100.85，诚通100.36，各1000",
+    "A: 前者量加到2000"
+  ],
+  "latest_message": {
+    "sender_id": "user_A",
+    "content": "前者量加到2000"
+  }
+}
+```
+
+---
+
+## 5. LLM 输出 Actions
+
+```json
+{
+  "actions": [
+    {
+      "action_type": "UPDATE",
+      "target_draft_id": "draft_1",
+      "updates": {
+        "amount": 2000
+      },
+      "reasoning": "用户说前者，结合当前草稿顺序，前者指24长发；量加到2000表示更新amount"
+    }
+  ]
+}
+```
+
+---
+
+## 6. 后端执行 Actions
+
+```python
+for action in actions:
+    if action["action_type"] == "UPDATE":
+        draft = find_draft(drafts, action["target_draft_id"])
+        apply_updates(draft, action["updates"], message_id)
+```
+
+---
+
+## 7. 保存状态并写事件
+
+```python
+save_session(session)
+save_drafts(drafts)
+save_events(events)
+```
+
+---
+
+# 五、`session_id` 的实际作用举例
+
+下面这个例子可以说明为什么需要 `session_id`。
+
+---
+
+## 没有 session 的情况
+
+系统里全局有很多草稿：
+
+```text
+draft_001: 24长发，昨天
+draft_002: 25诚通，昨天
+draft_003: 24长发，今天
+draft_004: 25诚通，今天
+```
+
+用户现在说：
+
+```text
+前者可以
+```
+
+模型很难判断：
+
+```text
+前者 = draft_001？
+前者 = draft_003？
+前者 = 今天这笔？
+前者 = 当前聊天里提到的那笔？
+```
+
+---
+
+## 有 session 的情况
+
+当前：
+
+```json
+{
+  "session_id": "session_001",
+  "drafts": [
+    {
+      "draft_id": "draft_003",
+      "asset_name": "24长发"
+    },
+    {
+      "draft_id": "draft_004",
+      "asset_name": "25诚通"
+    }
+  ]
+}
+```
+
+用户说：
+
+```text
+前者可以
+```
+
+模型只需要在当前 `session_001` 里判断：
+
+```text
+前者 = draft_003
+```
+
+这就清楚很多。
+
+---
+
+# 六、关于“定位靠 trade_draft”的进一步说明
+
+你说定位靠 `trade_draft`，这没错，但要注意：
+
+> 用户嘴里不会说 `draft_id`。
+
+用户会说：
+
+```text
+前者
+后者
+这笔
+那笔
+长发
+诚通
+第二笔
+刚才那个
+你报的第二个
+```
+
+所以 LLM 输出的定位方式不一定直接是 `draft_id`，可以是一组定位线索。
+
+例如：
+
+```json
+{
+  "target": {
+    "draft_id": "draft_1",
+    "asset_name": "24长发",
+    "ordinal": 1,
+    "reference": "前者"
+  }
+}
+```
+
+后端再做最终匹配。
+
+更稳妥的做法是：
+
+```json
+{
+  "action_type": "UPDATE",
+  "target": {
+    "draft_id": "draft_1",
+    "matched_by": "ordinal_reference",
+    "confidence": 0.92
+  },
+  "updates": {
+    "amount": 2000
+  }
+}
+```
+
+如果置信度低，就不要直接更新，而是反问：
+
+```text
+您说的“前者”是指 24长发 这一笔吗？
+```
+
+---
+
+# 七、推荐你的 Action Schema
+
+你可以把 LLM 输出的 Action 设计成下面这样。
+
+```json
+{
+  "actions": [
+    {
+      "action_type": "CREATE | UPDATE | CONFIRM | REJECT | CLARIFY | CANCEL",
+      "target": {
+        "draft_id": "draft_1",
+        "asset_name": "24长发",
+        "asset_code": "032481632.IB",
+        "reference_expression": "前者",
+        "ordinal": 1
+      },
+      "updates": {
+        "amount": 2000,
+        "price": 100.88
+      },
+      "confidence": 0.93,
+      "reasoning": "用户说前者量加到2000，结合当前草稿顺序，前者指24长发"
+    }
+  ],
+  "clarify_question": null
+}
+```
+
+---
+
+## Action 类型建议
+
+| action_type | 含义 |
+|---|---|
+| `CREATE` | 发现新的交易意图，创建新的 trade_draft |
+| `UPDATE` | 更新某个 trade_draft 的字段 |
+| `CONFIRM` | 用户确认某笔交易 |
+| `REJECT` | 用户拒绝某笔交易 |
+| `CANCEL` | 用户取消某笔交易 |
+| `CLARIFY` | 信息不明确，需要反问 |
+| `NOOP` | 当前消息没有有效状态变更 |
+
+---
+
+# 八、什么时候不应该直接更新，而应该反问？
+
+交易场景里不能所有识别结果都直接落库。
+
+比如用户说：
+
+```text
+量改一下
+```
+
+但没有说改哪笔，也没说改成多少。
+
+这时应该：
+
+```json
+{
+  "action_type": "CLARIFY"
+}
+```
+
+反问：
+
+```text
+请问您要修改哪一笔的量？修改为多少？
+```
+
+再比如：
+
+```text
+后者价格不太对
+```
+
+但没有说正确价格是多少。
+
+可以反问：
+
+```text
+请问 25诚通 的正确价格是多少？
+```
+
+---
+
+# 九、最小可行架构建议
+
+如果你现在要落地，我建议不要一开始做得太复杂。第一版可以这样：
+
+---
+
+## 1. 用 `conversation_key` 生成活跃 `session`
+
+```python
+conversation_key = f"{channel}:{sender_id}:{receiver_id}"
+```
+
+群聊则是：
+
+```python
+conversation_key = f"{channel}:{group_id}"
+```
+
+---
+
+## 2. Redis 存活跃 session
+
+```text
+dst:conv:{conversation_key}:active_session
+```
+
+例如：
+
+```text
+dst:conv:qq:group_8899:active_session = session_001
+```
+
+过期时间：
+
+```text
+30 分钟 / 60 分钟 / 当日有效
+```
+
+---
+
+## 3. Redis 或 SQLite 存 session 状态
+
+Redis 适合做实时状态：
+
+```text
+dst:session:{session_id}:state
+```
+
+内容：
+
+```json
+{
+  "session_id": "session_001",
+  "status": "negotiating",
+  "drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "price": 100.85,
+      "amount": 1000,
+      "status": "negotiating"
+    },
+    {
+      "draft_id": "draft_2",
+      "asset_name": "25诚通",
+      "price": 100.36,
+      "amount": 1000,
+      "status": "negotiating"
+    }
+  ]
+}
+```
+
+如果需要审计和复盘，建议同步写 SQLite / MySQL / PostgreSQL。
+
+---
+
+## 4. 每次消息处理流程
+
+```python
+def on_message(message):
+    conversation_key = resolve_conversation_key(message)
+    session_id = session_resolver.resolve(conversation_key, message)
+
+    session_state = load_session_state(session_id)
+    recent_messages = load_recent_messages(session_id, limit=10)
+
+    llm_result = llm_extract_actions(
+        drafts=session_state["drafts"],
+        history=recent_messages,
+        latest_message=message
+    )
+
+    events = apply_actions(
+        session_id=session_id,
+        drafts=session_state["drafts"],
+        actions=llm_result["actions"],
+        message=message
+    )
+
+    save_session_state(session_state)
+    save_messages(message, session_id)
+    save_events(events)
+
+    return session_state
+```
+
+---
+
+# 十、你可以把 `session_id` 理解成什么？
+
+可以用一个类比。
+
+```text
+session_id = 当前这桌谈判
+trade_draft = 桌上正在谈的几笔交易
+slot = 每笔交易里的具体条款
+message = 双方刚才说的话
+action = 这句话导致桌上哪个条款发生变化
+event = 变化记录
+```
+
+如果没有 `session_id`，相当于所有交易员所有历史谈判都挤在同一张桌子上。  
+这时有人说一句“前者可以”，系统根本不知道他在说哪张桌子上的哪笔交易。
+
+---
+
+# 十一、总结你的两个问题
+
+## 问题 1：前端请求怎么带 `session_id`？
+
+答案是：
+
+> 能带最好；不能带就后端推断。
+
+具体做法：
+
+1. 如果上游有 `conversation_id / room_id / thread_id`，直接用它作为基础。
+2. 如果没有，就用 `发送人 + 接收人 / 群组 + 时间窗口` 生成 `conversation_key`。
+3. 在服务入口加 `Session Resolver`，维护活跃 `session`。
+4. 第一版可以不让前端传，由后端消息接入层自动生成并绑定。
+
+---
+
+## 问题 2：`session_id` 到底有什么用？
+
+答案是：
+
+> `session_id` 不是简单的 `trade_draft` 集合，而是交易协商的上下文边界。
+
+它的作用包括：
+
+1. 限定模型当前可见的候选 `trade_draft`；
+2. 支持“前者、后者、这笔、那笔”的指代消解；
+3. 支持多笔交易并行协商；
+4. 控制状态生命周期；
+5. 隔离不同聊天上下文；
+6. 降低 LLM 上下文成本；
+7. 方便审计、反馈和错误复盘；
+8. 避免已关闭交易被后续消息误更新。
+
+---
+
+# 十二、我建议你的最终心智模型
+
+把系统从：
+
+```text
+消息 -> NER抽取字段
+```
+
+升级为：
+
+```text
+消息 -> Session Resolver -> 当前协商状态 -> LLM增量理解 -> Actions -> 状态合并 -> 交易草稿更新 -> 成单/反馈
+```
+
+其中：
+
+```text
+session_id 管“这是哪一场协商”
+trade_draft_id 管“这是哪一笔交易”
+slot 管“这笔交易的字段现在是什么状态”
+message_id 管“这个状态是哪句话导致的”
+event 管“状态是怎么变化的”
+```
+
+这样你的服务才能从单条消息 NER，真正升级成多轮交易对话理解服务。
+
