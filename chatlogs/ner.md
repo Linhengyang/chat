@@ -3909,3 +3909,2131 @@ return LLMActionsResponse.model_validate_json(response_text)
 2. **带 JSON 修复、重试、结构化输出校验的版本**
 3. **增加反馈接口 `/api/feedback` 的完整闭环版本**
 
+
+---
+🙋**user**:
+---
+```
+好的。其一帮我补上JSON 修复、重试、结构化输出校验, 其二给我补上 /api/feedback. 要求feedback把记录落盘到 /data/feedback.db
+```
+
+---
+🤖**assistant**:
+---
+
+下面给你补齐两块能力：
+
+1. **LLM 输出 JSON 修复、重试、结构化输出校验**
+2. **新增 `/api/feedback`，并将反馈单独落盘到 `data/feedback.db`**
+
+你可以把下面的内容理解为：  
+**在上一版代码基础上做增量补丁。**
+
+---
+
+# 一、目录结构更新
+
+现在建议项目变成这样：
+
+```text
+trade-dialogue-ner/
+├── main.py
+├── requirements.txt
+├── README.md
+├── data/
+│   └── .gitkeep
+└── src/
+    ├── __init__.py
+    ├── config.py
+    ├── models.py
+    ├── db.py
+    ├── state_store.py
+    ├── session_resolver.py
+    ├── llm.py
+    ├── json_utils.py
+    ├── parsing.py
+    ├── feedback_store.py
+    ├── service.py
+    └── api.py
+```
+
+其中：
+
+- `src/json_utils.py`：JSON 修复
+- `src/parsing.py`：LLM 输出结构化校验
+- `src/feedback_store.py`：feedback 单独 SQLite 存储
+- `src/llm.py`：接入真实 Qwen、重试、修复、解析
+- `data/app.db`：交易对话状态主库
+- `data/feedback.db`：反馈库
+
+---
+
+# 二、requirements.txt
+
+增加 `requests`：
+
+```txt
+fastapi
+uvicorn[standard]
+pydantic>=2
+requests
+```
+
+---
+
+# 三、src/config.py
+
+这个文件需要替换成下面这个版本。
+
+```python
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# 主业务数据库：session / message / trade_draft / draft_event
+DB_PATH = DATA_DIR / "app.db"
+
+# 反馈数据库：feedback
+FEEDBACK_DB_PATH = DATA_DIR / "feedback.db"
+
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+
+# mock / qwen
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
+
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+# Qwen / OpenAI-compatible API
+QWEN_API_URL = os.getenv(
+    "QWEN_API_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+)
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+# 如果你的 Qwen 接口支持 response_format=json_object，可以打开
+QWEN_USE_RESPONSE_FORMAT = _env_bool("QWEN_USE_RESPONSE_FORMAT", False)
+```
+
+---
+
+# 四、src/models.py
+
+这里在上一版基础上增加 Feedback 相关模型。  
+你可以整体替换 `src/models.py`。
+
+```python
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class IncomingMessage(BaseModel):
+    """
+    原始聊天消息。
+    前端不传 session_id。
+    """
+    message_id: Optional[str] = None
+    sender_id: str
+    receiver_id: Optional[str] = None
+    group_id: Optional[str] = None
+    channel: str = "default"
+    content: str
+    ts: Optional[datetime] = None
+
+
+class ActionType(str, Enum):
+    CREATE = "CREATE"
+    UPDATE = "UPDATE"
+    CONFIRM = "CONFIRM"
+    REJECT = "REJECT"
+    CANCEL = "CANCEL"
+    CLARIFY = "CLARIFY"
+    NOOP = "NOOP"
+
+
+class ActionTarget(BaseModel):
+    """
+    LLM 对交易草稿的定位线索。
+    """
+    draft_id: Optional[str] = None
+    asset_name: Optional[str] = None
+    asset_code: Optional[str] = None
+    reference_expression: Optional[str] = None
+    ordinal: Optional[int] = None
+
+
+class Action(BaseModel):
+    """
+    单条增量操作指令。
+    """
+    action_type: ActionType
+    target: Optional[ActionTarget] = None
+    updates: Dict[str, Any] = Field(default_factory=dict)
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+
+
+class LLMActionsResponse(BaseModel):
+    """
+    LLM / ActionExtractor 输出。
+    """
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+
+
+class SlotState(BaseModel):
+    """
+    单个字段状态。
+    """
+    value: Any
+    status: str = "proposed"  # proposed / confirmed / rejected / ambiguous
+    source_message_id: Optional[str] = None
+    confidence: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class TradeDraft(BaseModel):
+    """
+    一笔交易草稿。
+    """
+    draft_id: str
+    session_id: str
+    asset_name: Optional[str] = None
+    asset_code: Optional[str] = None
+    direction: Optional[str] = None
+    amount: Optional[float] = None
+    price: Optional[float] = None
+    status: str = "negotiating"  # negotiating / confirmed / rejected / cancelled
+    slots: Dict[str, SlotState] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class Session(BaseModel):
+    """
+    一次交易协商上下文。
+    """
+    session_id: str
+    conversation_key: str
+    channel: str
+    status: str = "negotiating"  # negotiating / closed / expired / cancelled
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+
+
+class MessageRecord(BaseModel):
+    """
+    落盘后的消息记录。
+    """
+    message_id: str
+    session_id: str
+    sender_id: str
+    receiver_id: Optional[str] = None
+    group_id: Optional[str] = None
+    channel: str = "default"
+    content: str
+    ts: datetime
+    created_at: Optional[datetime] = None
+
+
+class DraftEvent(BaseModel):
+    """
+    状态变更事件，用于审计、回滚、反馈。
+    """
+    event_id: str
+    session_id: str
+    draft_id: Optional[str] = None
+    message_id: Optional[str] = None
+    action_type: str
+    field: Optional[str] = None
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    reasoning: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class ProcessResult(BaseModel):
+    """
+    单次消息处理结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+
+
+class SessionResolveResult(BaseModel):
+    """
+    SessionResolver 调试/解析接口返回。
+    """
+    session_id: str
+    conversation_key: str
+    created: bool
+    session: Session
+
+
+class SessionDetail(BaseModel):
+    """
+    查询 session 详情。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    messages: List[MessageRecord] = Field(default_factory=list)
+
+
+# ----------------------------
+# Feedback
+# ----------------------------
+
+class FeedbackType(str, Enum):
+    EXTRACTION_ERROR = "extraction_error"
+    STATE_ERROR = "state_error"
+    UI_CORRECTION = "ui_correction"
+    COMMENT = "comment"
+
+
+class FeedbackCreate(BaseModel):
+    """
+    创建反馈请求。
+    """
+    session_id: Optional[str] = None
+    draft_id: Optional[str] = None
+    message_id: Optional[str] = None
+    event_id: Optional[str] = None
+
+    feedback_type: FeedbackType = FeedbackType.EXTRACTION_ERROR
+
+    # 如果反馈针对某个字段，例如 amount / price / asset_name
+    field: Optional[str] = None
+
+    # 期望值 / 实际值，可以是字符串、数字、对象
+    expected_value: Optional[Any] = None
+    actual_value: Optional[Any] = None
+
+    comment: Optional[str] = None
+    status: str = "open"  # open / resolved / ignored
+
+    @field_validator("status")
+    @classmethod
+    def normalize_status(cls, value: Optional[str]) -> str:
+        value = (value or "open").lower()
+        if value not in {"open", "resolved", "ignored"}:
+            return "open"
+        return value
+
+
+class FeedbackRecord(FeedbackCreate):
+    """
+    落盘后的反馈记录。
+    """
+    feedback_id: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+```
+
+---
+
+# 五、src/json_utils.py
+
+这个文件负责 **JSON 修复**。
+
+```python
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, List
+
+
+class JsonRepairError(ValueError):
+    pass
+
+
+def strip_markdown_fences(text: str) -> str:
+    """
+    去掉 ```json ... ``` 这类 markdown 包裹。
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # 去掉开头 ```json / ```JSON / ```
+    text = re.sub(r"^```(?:json|JSON)?\s*", "", text)
+
+    # 去掉结尾 ```
+    text = re.sub(r"\s*```$", "", text)
+
+    # 兜底：删除所有残留 ```
+    text = text.replace("```json", "").replace("```JSON", "").replace("```", "")
+
+    return text.strip()
+
+
+def extract_outermost_json(text: str) -> str:
+    """
+    从一段混杂文本里，抽取最外层的 JSON 对象或数组。
+    """
+    if not text:
+        return ""
+
+    candidates = []
+
+    for start_char, end_char in (("{", "}"), ("[", "]")):
+        start = text.find(start_char)
+        end = text.rfind(end_char)
+
+        if start != -1 and end != -1 and end > start:
+            candidates.append(text[start:end + 1])
+
+    if not candidates:
+        return text
+
+    # 返回最长的那个，通常最完整
+    return max(candidates, key=len)
+
+
+def remove_comments(text: str) -> str:
+    """
+    尽量去掉注释。
+    注意：这是启发式修复，不能保证 100% 安全。
+    """
+    if not text:
+        return ""
+
+    # 块注释
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+
+    # 行注释
+    text = re.sub(r"^\s*//.*$", "", text, flags=re.M)
+
+    return text
+
+
+def normalize_python_literals(text: str) -> str:
+    """
+    将 Python 风格字面量转成 JSON。
+    """
+    if not text:
+        return ""
+
+    text = re.sub(r"\bTrue\b", "true", text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    text = re.sub(r"\bNone\b", "null", text)
+
+    return text
+
+
+def normalize_chinese_quotes(text: str) -> str:
+    """
+    将部分中文引号替换成 JSON 可识别的双引号。
+    """
+    if not text:
+        return ""
+
+    text = text.replace("“", '"')
+    text = text.replace("”", '"')
+    text = text.replace("‘", "'")
+    text = text.replace("’", "'")
+
+    return text
+
+
+def quote_unquoted_keys(text: str) -> str:
+    """
+    尝试给未加引号的 key 加引号。
+
+    例如：
+    {name: "abc"} -> {"name": "abc"}
+    """
+    if not text:
+        return ""
+
+    return re.sub(
+        r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:",
+        r'\1"\2":',
+        text,
+    )
+
+
+def remove_trailing_commas(text: str) -> str:
+    """
+    删除尾逗号。
+
+    例如：
+    {"a": 1,} -> {"a": 1}
+    [1, 2,] -> [1, 2]
+    """
+    if not text:
+        return ""
+
+    return re.sub(r",\s*([}\]])", r"\1", text)
+
+
+def replace_single_quotes(text: str) -> str:
+    """
+    最后兜底：把单引号替换成双引号。
+
+    注意：
+    这个策略比较暴力，只作为最后修复手段。
+    """
+    if not text:
+        return ""
+
+    return text.replace("'", '"')
+
+
+def repair_json_text(text: str) -> str:
+    """
+    组合多种 JSON 修复策略。
+    """
+    if not text:
+        return ""
+
+    repaired = strip_markdown_fences(text)
+    repaired = extract_outermost_json(repaired)
+    repaired = remove_comments(repaired)
+    repaired = normalize_chinese_quotes(repaired)
+    repaired = normalize_python_literals(repaired)
+    repaired = quote_unquoted_keys(repaired)
+    repaired = remove_trailing_commas(repaired)
+
+    return repaired.strip()
+
+
+def _dedupe_candidates(candidates: List[str]) -> List[str]:
+    seen = set()
+    result = []
+
+    for item in candidates:
+        if not item:
+            continue
+
+        if item in seen:
+            continue
+
+        seen.add(item)
+        result.append(item)
+
+    return result
+
+
+def robust_json_loads(text: Any) -> Any:
+    """
+    尽力把 LLM 输出解析成 JSON。
+
+    支持：
+    1. 标准 JSON
+    2. markdown code fence
+    3. 混杂文本中的 JSON 片段
+    4. 尾逗号
+    5. 未加引号的 key
+    6. Python 字面量 True / False / None
+    7. 中文引号
+    8. 单引号兜底
+    """
+    if text is None:
+        raise JsonRepairError("LLM output is empty")
+
+    # 如果已经是 dict/list，直接返回
+    if isinstance(text, (dict, list)):
+        return text
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    original = text.strip()
+
+    if not original:
+        raise JsonRepairError("LLM output is empty")
+
+    no_fences = strip_markdown_fences(original)
+    extracted = extract_outermost_json(no_fences)
+    repaired = repair_json_text(original)
+    aggressive = replace_single_quotes(extracted or repaired)
+
+    candidates = _dedupe_candidates(
+        [
+            original,
+            no_fences,
+            extracted,
+            repaired,
+            aggressive,
+        ]
+    )
+
+    last_error: Exception | None = None
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception as exc:
+            last_error = exc
+
+    raise JsonRepairError(
+        f"Cannot repair and parse LLM output as JSON. Last error: {last_error}"
+    ) from last_error
+```
+
+---
+
+# 六、src/parsing.py
+
+这个文件负责：
+
+1. 调 `json_utils` 修复 JSON
+2. 用 Pydantic 做结构化校验
+3. 清洗不合理的 Action
+
+```python
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from pydantic import ValidationError
+
+from .json_utils import JsonRepairError, robust_json_loads
+from .models import Action, ActionType, ActionTarget, LLMActionsResponse
+
+
+class ActionParseError(ValueError):
+    pass
+
+
+ALLOWED_UPDATE_FIELDS = {
+    "asset_name",
+    "asset_code",
+    "direction",
+    "amount",
+    "price",
+}
+
+
+def _wrap_payload(obj: Any) -> Dict[str, Any]:
+    """
+    尽量兼容模型返回格式。
+
+    支持：
+    1. [ {...}, {...} ]
+    2. { "action_type": "UPDATE", ... }
+    3. { "actions": [ ... ] }
+    """
+    if isinstance(obj, list):
+        return {"actions": obj}
+
+    if isinstance(obj, dict):
+        if "actions" in obj:
+            return obj
+
+        if "action_type" in obj:
+            return {"actions": [obj]}
+
+        return obj
+
+    raise ActionParseError(f"Unsupported LLM output type: {type(obj)}")
+
+
+def _sanitize_target(target: Optional[ActionTarget]) -> Optional[ActionTarget]:
+    if target is None:
+        return None
+
+    has_any_value = any(
+        [
+            target.draft_id,
+            target.asset_name,
+            target.asset_code,
+            target.reference_expression,
+            target.ordinal is not None,
+        ]
+    )
+
+    if not has_any_value:
+        return None
+
+    return target
+
+
+def _sanitize_action(action: Action) -> Optional[Action]:
+    """
+    对单个 Action 做清洗。
+    """
+    action.target = _sanitize_target(action.target)
+
+    # CREATE 时，如果 updates 为空，但 target 里有资产名/代码，则补到 updates
+    if action.action_type == ActionType.CREATE:
+        updates = dict(action.updates or {})
+
+        if action.target:
+            if action.target.asset_name and not updates.get("asset_name"):
+                updates["asset_name"] = action.target.asset_name
+
+            if action.target.asset_code and not updates.get("asset_code"):
+                updates["asset_code"] = action.target.asset_code
+
+        action.updates = updates
+
+    # UPDATE / CREATE 只允许白名单字段
+    if action.updates:
+        filtered_updates = {}
+
+        for key, value in action.updates.items():
+            if key not in ALLOWED_UPDATE_FIELDS:
+                continue
+
+            if value is None:
+                continue
+
+            filtered_updates[key] = value
+
+        action.updates = filtered_updates
+
+    # UPDATE 没有更新字段，则无意义
+    if action.action_type == ActionType.UPDATE and not action.updates:
+        return None
+
+    # CREATE 如果既没有 updates，也没有 target 资产信息，则无意义
+    if action.action_type == ActionType.CREATE:
+        target_has_asset = bool(
+            action.target
+            and (
+                action.target.asset_name
+                or action.target.asset_code
+            )
+        )
+
+        if not action.updates and not target_has_asset:
+            return None
+
+    return action
+
+
+def parse_llm_actions(raw_output: Any) -> LLMActionsResponse:
+    """
+    将 LLM 原始输出解析并校验为 LLMActionsResponse。
+    """
+    try:
+        data = robust_json_loads(raw_output)
+    except JsonRepairError as exc:
+        raise ActionParseError(f"JSON repair failed: {exc}") from exc
+
+    payload = _wrap_payload(data)
+
+    try:
+        parsed = LLMActionsResponse.model_validate(payload)
+    except ValidationError as exc:
+        raise ActionParseError(f"Pydantic validation failed: {exc}") from exc
+
+    sanitized_actions = []
+
+    for action in parsed.actions:
+        clean_action = _sanitize_action(action)
+        if clean_action is not None:
+            sanitized_actions.append(clean_action)
+
+    parsed.actions = sanitized_actions
+
+    return parsed
+```
+
+---
+
+# 七、src/llm.py
+
+这个文件建议整体替换。
+
+它包含：
+
+1. `MockActionExtractor`
+2. `QwenActionExtractor`
+3. Qwen API 调用
+4. 重试
+5. 修复式重试
+6. 结构化输出校验
+
+```python
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+import requests
+
+from . import config
+from .models import (
+    Action,
+    ActionTarget,
+    ActionType,
+    IncomingMessage,
+    LLMActionsResponse,
+    MessageRecord,
+    Session,
+    TradeDraft,
+)
+from .parsing import ActionParseError, parse_llm_actions
+
+
+logger = logging.getLogger(__name__)
+
+
+CREATE_WORDS = [
+    "新",
+    "另外",
+    "再开",
+    "再加",
+    "还有",
+    "增加一笔",
+    "新开",
+]
+
+REJECT_WORDS = [
+    "不要了",
+    "取消",
+    "不做了",
+    "拒绝",
+    "算了",
+]
+
+CONFIRM_WORDS = [
+    "确认",
+    "成交",
+    "done",
+    "ok",
+    "同意",
+    "没问题",
+]
+
+STOP_SUFFIXES = "有量吗呢吧啊的了么和与跟及，。！？、；,：:"
+
+
+class ActionExtractor(ABC):
+    """
+    增量动作抽取接口。
+    """
+
+    @abstractmethod
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        raise NotImplementedError
+
+
+# ----------------------------
+# helpers for mock extractor
+# ----------------------------
+
+def _extract_asset_names(text: str) -> List[str]:
+    raw = re.findall(
+        r"\d{1,2}[\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9]{1,20}",
+        text,
+    )
+
+    names: List[str] = []
+
+    for token in raw:
+        token = token.strip()
+
+        while token and token[-1] in STOP_SUFFIXES:
+            token = token[:-1]
+
+        if len(token) >= 3:
+            names.append(token)
+
+    seen = set()
+    result = []
+
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+
+    return result
+
+
+def _extract_amount(text: str) -> Optional[float]:
+    m = re.search(
+        r"(?:量|金额|面额|amount)[^\d]{0,10}?(\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1))
+
+    m = re.search(r"加到\s*(\d+(?:\.\d+)?)", text)
+    if m:
+        return float(m.group(1))
+
+    return None
+
+
+def _extract_price(text: str) -> Optional[float]:
+    m = re.search(
+        r"(?:价格|净价|全价|价)[^\d]{0,10}?(\d+(?:\.\d+)?)",
+        text,
+    )
+    if m:
+        return float(m.group(1))
+
+    if any(word in text for word in ["价格", "净价", "全价", "价"]):
+        m = re.search(r"(\d+\.\d{1,4})", text)
+        if m:
+            return float(m.group(1))
+
+    return None
+
+
+def _parse_ordinal(text: str) -> int:
+    if text.isdigit():
+        return int(text)
+
+    mapping = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    if text in mapping:
+        return mapping[text]
+
+    if "十" in text:
+        parts = text.split("十", 1)
+        left = parts[0]
+        right = parts[1]
+
+        left_value = mapping.get(left, 1) if left else 1
+        right_value = mapping.get(right, 0) if right else 0
+
+        return left_value * 10 + right_value
+
+    return 1
+
+
+def _name_exists(name: str, drafts: List[TradeDraft]) -> bool:
+    lower_name = name.lower()
+
+    for draft in drafts:
+        if not draft.asset_name:
+            continue
+
+        lower_existing = draft.asset_name.lower()
+
+        if lower_name in lower_existing or lower_existing in lower_name:
+            return True
+
+    return False
+
+
+def _build_target(
+    content: str,
+    drafts: List[TradeDraft],
+) -> Optional[ActionTarget]:
+    lowered = content.lower()
+
+    for draft in drafts:
+        if draft.asset_name and draft.asset_name.lower() in lowered:
+            return ActionTarget(
+                draft_id=draft.draft_id,
+                asset_name=draft.asset_name,
+            )
+
+        if draft.asset_code and draft.asset_code.lower() in lowered:
+            return ActionTarget(
+                draft_id=draft.draft_id,
+                asset_code=draft.asset_code,
+            )
+
+    if any(word in content for word in ["前者", "第一笔", "第1笔"]):
+        return ActionTarget(
+            reference_expression="前者",
+            ordinal=1,
+        )
+
+    if any(
+        word in content
+        for word in ["后者", "最后一笔", "最后的一笔", "第二笔", "第2笔"]
+    ):
+        return ActionTarget(
+            reference_expression="后者",
+            ordinal=2,
+        )
+
+    m = re.search(r"第([0-9一二两三四五六七八九十]+)笔", content)
+    if m:
+        ordinal = _parse_ordinal(m.group(1))
+        return ActionTarget(
+            reference_expression=m.group(0),
+            ordinal=ordinal,
+        )
+
+    if any(word in content for word in ["这笔", "当前这笔"]):
+        return ActionTarget(reference_expression="这笔")
+
+    if any(word in content for word in ["那笔"]):
+        return ActionTarget(reference_expression="那笔")
+
+    return None
+
+
+# ----------------------------
+# Mock extractor
+# ----------------------------
+
+class MockActionExtractor(ActionExtractor):
+    """
+    本地规则 Mock，仅用于开发联调。
+    """
+
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        content = message.content.strip()
+        content_lower = content.lower()
+
+        actions: List[Action] = []
+        clarify_question: Optional[str] = None
+
+        asset_names = _extract_asset_names(content)
+        new_names = [
+            name
+            for name in asset_names
+            if not _name_exists(name, drafts)
+        ]
+
+        names_to_create: List[str] = []
+
+        if not drafts and asset_names:
+            names_to_create = asset_names
+        elif new_names and any(word in content for word in CREATE_WORDS):
+            names_to_create = new_names
+
+        for name in names_to_create:
+            actions.append(
+                Action(
+                    action_type=ActionType.CREATE,
+                    target=ActionTarget(asset_name=name),
+                    updates={"asset_name": name},
+                    confidence=0.6,
+                    reasoning="mock: create trade draft",
+                )
+            )
+
+        target = _build_target(content, drafts)
+
+        updates = {}
+
+        amount = _extract_amount(content)
+        if amount is not None:
+            updates["amount"] = amount
+
+        price = _extract_price(content)
+        if price is not None:
+            updates["price"] = price
+
+        if any(word in content for word in REJECT_WORDS):
+            actions.append(
+                Action(
+                    action_type=ActionType.REJECT,
+                    target=target,
+                    confidence=0.7,
+                    reasoning="mock: reject/cancel",
+                )
+            )
+        elif any(word.lower() in content_lower for word in CONFIRM_WORDS):
+            actions.append(
+                Action(
+                    action_type=ActionType.CONFIRM,
+                    target=target,
+                    confidence=0.7,
+                    reasoning="mock: confirm",
+                )
+            )
+        elif updates:
+            actions.append(
+                Action(
+                    action_type=ActionType.UPDATE,
+                    target=target,
+                    updates=updates,
+                    confidence=0.7,
+                    reasoning="mock: update fields",
+                )
+            )
+        elif (
+            not actions
+            and len(drafts) > 1
+            and target is None
+            and ("?" in content or "？" in content or "哪" in content)
+        ):
+            clarify_question = "请问您指的是哪一笔？"
+
+        return LLMActionsResponse(
+            actions=actions,
+            clarify_question=clarify_question,
+        )
+
+
+# ----------------------------
+# Qwen API
+# ----------------------------
+
+def _post_qwen(payload: dict) -> str:
+    if not config.QWEN_API_KEY:
+        raise RuntimeError("QWEN_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {config.QWEN_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(
+            config.QWEN_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=config.LLM_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        return data["choices"][0]["message"]["content"] or ""
+
+    except requests.HTTPError as exc:
+        status_code = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+        body = exc.response.text if exc.response is not None else ""
+
+        raise RuntimeError(
+            f"Qwen API HTTP error: {status_code}, body: {body[:1000]}"
+        ) from exc
+
+    except Exception as exc:
+        raise RuntimeError(f"Qwen API call failed: {exc}") from exc
+
+
+def call_qwen_api(prompt: str) -> str:
+    """
+    调用 Qwen / OpenAI-compatible chat completion API。
+    """
+    base_payload = {
+        "model": config.QWEN_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise dialogue state tracking assistant. "
+                    "You must output valid JSON only. "
+                    "Do not output explanations. "
+                    "Do not output markdown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+
+    if config.QWEN_USE_RESPONSE_FORMAT:
+        payload = dict(base_payload)
+        payload["response_format"] = {"type": "json_object"}
+
+        try:
+            return _post_qwen(payload)
+        except RuntimeError as exc:
+            # 如果服务端不支持 response_format，则降级重试一次
+            if "response_format" in str(exc):
+                fallback_payload = dict(base_payload)
+                return _post_qwen(fallback_payload)
+
+            raise
+    else:
+        return _post_qwen(base_payload)
+
+
+# ----------------------------
+# Qwen extractor
+# ----------------------------
+
+class QwenActionExtractor(ActionExtractor):
+    """
+    真实 Qwen 增量状态抽取器。
+
+    特性：
+    1. 自动重试
+    2. JSON 修复
+    3. Pydantic 结构化校验
+    4. 解析失败时带错误信息再次请求模型修复
+    5. 最终失败时降级为 NOOP + clarify
+    """
+
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+        base_prompt = build_prompt(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        last_raw_output = ""
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, config.LLM_MAX_RETRIES + 1):
+            current_prompt = (
+                base_prompt
+                if attempt == 1
+                else build_repair_prompt(
+                    base_prompt=base_prompt,
+                    bad_output=last_raw_output,
+                    error_message=str(last_error),
+                )
+            )
+
+            try:
+                raw_output = call_qwen_api(current_prompt)
+                last_raw_output = raw_output
+
+                parsed = parse_llm_actions(raw_output)
+
+                logger.info(
+                    "Qwen extraction succeeded, session=%s, attempt=%s, actions=%s",
+                    session.session_id,
+                    attempt,
+                    len(parsed.actions),
+                )
+
+                return parsed
+
+            except ActionParseError as exc:
+                last_error = exc
+                logger.warning(
+                    "Qwen output parse failed, session=%s, attempt=%s, error=%s",
+                    session.session_id,
+                    attempt,
+                    exc,
+                )
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Qwen API call failed, session=%s, attempt=%s, error=%s",
+                    session.session_id,
+                    attempt,
+                    exc,
+                )
+
+            if attempt < config.LLM_MAX_RETRIES:
+                sleep_seconds = 0.5 * (2 ** (attempt - 1))
+                time.sleep(sleep_seconds)
+
+        logger.exception(
+            "Qwen extraction failed after %s retries, session=%s",
+            config.LLM_MAX_RETRIES,
+            session.session_id,
+        )
+
+        # 降级：不直接 500，避免阻塞聊天流程
+        return LLMActionsResponse(
+            actions=[
+                Action(
+                    action_type=ActionType.NOOP,
+                    reasoning=f"extraction failed after retries: {last_error}",
+                )
+            ],
+            clarify_question="抱歉，系统暂时无法理解这条消息。请明确说明标的、字段和数值，例如：24长发，量改为2000。",
+        )
+
+
+# ----------------------------
+# Prompt
+# ----------------------------
+
+def build_prompt(
+    *,
+    session: Session,
+    drafts: List[TradeDraft],
+    history: List[MessageRecord],
+    message: IncomingMessage,
+) -> str:
+    drafts_payload = [
+        {
+            "draft_id": draft.draft_id,
+            "asset_name": draft.asset_name,
+            "asset_code": draft.asset_code,
+            "direction": draft.direction,
+            "amount": draft.amount,
+            "price": draft.price,
+            "status": draft.status,
+        }
+        for draft in drafts
+    ]
+
+    history_payload = [
+        {
+            "sender_id": item.sender_id,
+            "content": item.content,
+            "ts": str(item.ts),
+        }
+        for item in history[-10:]
+    ]
+
+    payload = {
+        "session": {
+            "session_id": session.session_id,
+            "status": session.status,
+        },
+        "current_drafts": drafts_payload,
+        "recent_history": history_payload,
+        "latest_message": {
+            "sender_id": message.sender_id,
+            "content": message.content,
+        },
+    }
+
+    return f"""
+# Role
+你是一个银行间市场交易对话状态追踪助手。
+
+# Task
+请根据【当前交易草稿状态】、【近期对话历史】和【最新一条消息】，分析最新消息带来了哪些增量状态变化。
+
+# Rules
+1. 你不要输出完整状态，只输出增量操作指令。
+2. 支持动作：CREATE / UPDATE / CONFIRM / REJECT / CANCEL / CLARIFY / NOOP。
+3. 如果能定位到具体 draft，请尽量输出 draft_id。
+4. 如果用户使用“前者、后者、这笔、那笔、第一笔、第二笔”等指代，请结合当前草稿列表和近期历史判断。
+5. 如果无法定位或信息不足，请输出 CLARIFY。
+6. 严格输出 JSON，不要输出解释文本。
+7. 不要输出 markdown，不要输出 ```json。
+
+# Output Schema
+{{
+  "actions": [
+    {{
+      "action_type": "UPDATE",
+      "target": {{
+        "draft_id": "draft_xxx",
+        "asset_name": "24长发",
+        "reference_expression": "前者",
+        "ordinal": 1
+      }},
+      "updates": {{
+        "amount": 2000,
+        "price": 100.88
+      }},
+      "confidence": 0.93,
+      "reasoning": "用户说前者量加到2000"
+    }}
+  ],
+  "clarify_question": null
+}}
+
+# Input
+{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}
+""".strip()
+
+
+def build_repair_prompt(
+    *,
+    base_prompt: str,
+    bad_output: str,
+    error_message: str,
+) -> str:
+    return f"""
+你上一次输出不是合法 JSON，或不符合 Output Schema。
+
+请你重新输出。要求：
+1. 只输出最终合法 JSON。
+2. 不要输出解释。
+3. 不要输出 markdown。
+4. 必须符合下面 Output Schema。
+
+# Original Task
+{base_prompt}
+
+# Your Previous Bad Output
+{bad_output}
+
+# Parse Error
+{error_message}
+
+# Your Task Now
+请重新输出符合 Output Schema 的合法 JSON。
+""".strip()
+
+
+def get_action_extractor() -> ActionExtractor:
+    provider = config.LLM_PROVIDER.lower()
+
+    if provider == "mock":
+        return MockActionExtractor()
+
+    if provider == "qwen":
+        return QwenActionExtractor()
+
+    raise ValueError(f"Unsupported LLM_PROVIDER: {config.LLM_PROVIDER}")
+```
+
+---
+
+# 八、src/feedback_store.py
+
+这个文件专门负责 `data/feedback.db`。
+
+```python
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from typing import Any, List, Optional
+
+from .config import FEEDBACK_DB_PATH
+from .models import FeedbackCreate, FeedbackRecord, FeedbackType
+from .state_store import iso, new_id, parse_iso, utcnow
+
+
+FEEDBACK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    draft_id TEXT,
+    message_id TEXT,
+    event_id TEXT,
+    feedback_type TEXT NOT NULL DEFAULT 'extraction_error',
+    field TEXT,
+    expected_value TEXT,
+    actual_value TEXT,
+    comment TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_session
+ON feedback(session_id);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_draft
+ON feedback(draft_id);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_message
+ON feedback(message_id);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_status
+ON feedback(status);
+"""
+
+
+def get_feedback_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def get_feedback_db():
+    conn = get_feedback_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_feedback_db() -> None:
+    with get_feedback_db() as conn:
+        conn.executescript(FEEDBACK_SCHEMA)
+
+
+def _to_json_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def _from_json_value(value: Optional[str]) -> Any:
+    if value is None:
+        return None
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def row_to_feedback(row) -> FeedbackRecord:
+    return FeedbackRecord(
+        feedback_id=row["feedback_id"],
+        session_id=row["session_id"],
+        draft_id=row["draft_id"],
+        message_id=row["message_id"],
+        event_id=row["event_id"],
+        feedback_type=FeedbackType(row["feedback_type"]),
+        field=row["field"],
+        expected_value=_from_json_value(row["expected_value"]),
+        actual_value=_from_json_value(row["actual_value"]),
+        comment=row["comment"],
+        status=row["status"],
+        created_at=parse_iso(row["created_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+    )
+
+
+def get_feedback(conn, feedback_id: str) -> Optional[FeedbackRecord]:
+    row = conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?",
+        (feedback_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_feedback(row)
+
+
+def create_feedback(payload: FeedbackCreate) -> FeedbackRecord:
+    feedback_id = new_id("fb")
+    now = utcnow()
+
+    with get_feedback_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO feedback (
+                feedback_id,
+                session_id,
+                draft_id,
+                message_id,
+                event_id,
+                feedback_type,
+                field,
+                expected_value,
+                actual_value,
+                comment,
+                status,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feedback_id,
+                payload.session_id,
+                payload.draft_id,
+                payload.message_id,
+                payload.event_id,
+                payload.feedback_type.value,
+                payload.field,
+                _to_json_value(payload.expected_value),
+                _to_json_value(payload.actual_value),
+                payload.comment,
+                payload.status,
+                iso(now),
+                iso(now),
+            ),
+        )
+
+        record = get_feedback(conn, feedback_id)
+
+        if record is None:
+            raise RuntimeError("Failed to create feedback record")
+
+        return record
+
+
+def list_feedback(
+    *,
+    session_id: Optional[str] = None,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> List[FeedbackRecord]:
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+
+    if draft_id:
+        clauses.append("draft_id = ?")
+        params.append(draft_id)
+
+    if message_id:
+        clauses.append("message_id = ?")
+        params.append(message_id)
+
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+
+    where_sql = ""
+    if clauses:
+        where_sql = "WHERE " + " AND ".join(clauses)
+
+    limit = max(1, min(limit, 1000))
+    params.append(limit)
+
+    with get_feedback_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM feedback
+            {where_sql}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+    return [row_to_feedback(row) for row in rows]
+```
+
+---
+
+# 九、src/api.py
+
+这个文件建议整体替换。  
+它在原有接口基础上新增 feedback 接口。
+
+```python
+from __future__ import annotations
+
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from . import feedback_store, state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .db import get_db
+from .llm import ActionExtractor, get_action_extractor
+from .models import (
+    DraftEvent,
+    FeedbackCreate,
+    FeedbackRecord,
+    IncomingMessage,
+    ProcessResult,
+    SessionDetail,
+    SessionResolveResult,
+    TradeDraft,
+)
+from .service import process_message
+from .session_resolver import DefaultSessionResolver, SessionResolver
+
+
+router = APIRouter(prefix="/api")
+
+
+def get_session_resolver() -> SessionResolver:
+    """
+    这里可以替换成自定义 SessionResolver。
+    """
+    return DefaultSessionResolver()
+
+
+def get_extractor() -> ActionExtractor:
+    return get_action_extractor()
+
+
+@router.post("/messages", response_model=ProcessResult)
+def api_process_message(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+    extractor: ActionExtractor = Depends(get_extractor),
+):
+    """
+    核心接口：接收一条新消息，执行增量状态更新。
+    """
+    return process_message(
+        message=payload,
+        resolver=resolver,
+        extractor=extractor,
+    )
+
+
+@router.post("/session-resolver/resolve", response_model=SessionResolveResult)
+def api_resolve_session(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+):
+    """
+    SessionResolver 调试接口。
+    """
+    with get_db() as conn:
+        conversation_key = resolver.conversation_key(payload)
+
+        existing = state_store.find_active_session(
+            conn,
+            conversation_key=conversation_key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        session = resolver.resolve(conn, payload)
+
+        return SessionResolveResult(
+            session_id=session.session_id,
+            conversation_key=conversation_key,
+            created=existing is None,
+            session=session,
+        )
+
+
+@router.get("/sessions/{session_id}", response_model=SessionDetail)
+def api_get_session(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        drafts = state_store.list_drafts(conn, session_id)
+        messages = state_store.list_recent_messages(
+            conn,
+            session_id=session_id,
+            limit=100,
+        )
+
+        return SessionDetail(
+            session=session,
+            drafts=drafts,
+            messages=messages,
+        )
+
+
+@router.get("/sessions/{session_id}/drafts", response_model=List[TradeDraft])
+def api_get_session_drafts(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        return state_store.list_drafts(conn, session_id)
+
+
+@router.get("/sessions/{session_id}/events", response_model=List[DraftEvent])
+def api_get_session_events(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        return state_store.list_events(conn, session_id)
+
+
+# ----------------------------
+# Feedback
+# ----------------------------
+
+@router.post(
+    "/feedback",
+    response_model=FeedbackRecord,
+    status_code=status.HTTP_201_CREATED,
+)
+def api_create_feedback(payload: FeedbackCreate):
+    """
+    创建一条反馈，落盘到 data/feedback.db。
+    """
+    return feedback_store.create_feedback(payload)
+
+
+@router.get("/feedback", response_model=List[FeedbackRecord])
+def api_list_feedback(
+    session_id: Optional[str] = None,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    查询反馈列表。
+
+    支持按：
+    - session_id
+    - draft_id
+    - message_id
+    - status_filter
+    查询。
+    """
+    return feedback_store.list_feedback(
+        session_id=session_id,
+        draft_id=draft_id,
+        message_id=message_id,
+        status=status_filter,
+        limit=limit,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/feedback",
+    response_model=List[FeedbackRecord],
+)
+def api_get_session_feedback(
+    session_id: str,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    查询某个 session 下的反馈。
+    """
+    return feedback_store.list_feedback(
+        session_id=session_id,
+        draft_id=draft_id,
+        message_id=message_id,
+        status=status_filter,
+        limit=limit,
+    )
+```
+
+---
+
+# 十、main.py
+
+这里需要在启动时初始化两个数据库。
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src.api import router
+from src.db import init_db
+from src.feedback_store import init_feedback_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化主业务库
+    init_db()
+
+    # 初始化 feedback 库
+    init_feedback_db()
+
+    yield
+
+
+app = FastAPI(
+    title="Trade Dialogue DST",
+    description="多轮交易对话状态追踪与增量 NER 服务",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+app.include_router(router, tags=["dst"])
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+```
+
+---
+
+# 十一、启动方式
+
+## 1. 使用 Mock 模式
+
+默认无需 Qwen API Key：
+
+```bash
+export LLM_PROVIDER=mock
+uvicorn main:app --reload
+```
+
+---
+
+## 2. 使用真实 Qwen 模式
+
+```bash
+export LLM_PROVIDER=qwen
+export QWEN_API_KEY="你的key"
+export QWEN_MODEL="qwen-plus"
+
+# 如果你的接口支持 response_format=json_object，可以打开
+export QWEN_USE_RESPONSE_FORMAT=true
+
+uvicorn main:app --reload
+```
+
+如果你用的是自建网关或 DashScope compatible mode，也可以指定：
+
+```bash
+export QWEN_API_URL="https://your-gateway/v1/chat/completions"
+```
+
+---
+
+# 十二、接口示例
+
+## 1. 发送消息
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_A",
+    "receiver_id": "trader_B",
+    "channel": "qq",
+    "content": "24长发和25诚通有量吗？"
+  }'
+```
+
+---
+
+## 2. 更新前者
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_id": "trader_A",
+    "receiver_id": "trader_B",
+    "channel": "qq",
+    "content": "前者量加到2000"
+  }'
+```
+
+---
+
+## 3. 提交 Feedback
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session_xxx",
+    "draft_id": "draft_xxx",
+    "message_id": "msg_xxx",
+    "feedback_type": "extraction_error",
+    "field": "amount",
+    "expected_value": 2000,
+    "actual_value": 1000,
+    "comment": "用户说的是前者量加到2000，但系统没有更新成功"
+  }'
+```
+
+返回类似：
+
+```json
+{
+  "feedback_id": "fb_xxx",
+  "session_id": "session_xxx",
+  "draft_id": "draft_xxx",
+  "message_id": "msg_xxx",
+  "event_id": null,
+  "feedback_type": "extraction_error",
+  "field": "amount",
+  "expected_value": 2000,
+  "actual_value": 1000,
+  "comment": "用户说的是前者量加到2000，但系统没有更新成功",
+  "status": "open",
+  "created_at": "2026-06-22T10:00:00Z",
+  "updated_at": "2026-06-22T10:00:00Z"
+}
+```
+
+---
+
+## 4. 查询 Feedback
+
+```bash
+curl "http://127.0.0.1:8000/api/feedback?limit=20"
+```
+
+按 session 查询：
+
+```bash
+curl "http://127.0.0.1:8000/api/feedback?session_id=session_xxx"
+```
+
+按 draft 查询：
+
+```bash
+curl "http://127.0.0.1:8000/api/feedback?draft_id=draft_xxx"
+```
+
+---
+
+## 5. 查询某个 session 的 feedback
+
+```bash
+curl "http://127.0.0.1:8000/api/sessions/session_xxx/feedback"
+```
+
+---
+
+# 十三、这次补上的能力到底做了什么？
+
+## 1. JSON 修复
+
+在 `src/json_utils.py` 中处理：
+
+- ```json 包裹
+- 输出里混有解释文本
+- 尾逗号
+- 未加引号的 key
+- 中文引号
+- Python 风格 `True / False / None`
+- 单引号 JSON 兜底
+- 从混杂文本中提取最外层 JSON
+
+---
+
+## 2. 结构化输出校验
+
+在 `src/parsing.py` 中处理：
+
+- 用 `Pydantic` 校验 `LLMActionsResponse`
+- 校验 `ActionType`
+- 校验 `ActionTarget`
+- 过滤非法字段
+- 清洗无意义的 `UPDATE`
+- 补全 `CREATE` 时 `target` 里的 `asset_name`
+
+---
+
+## 3. 重试机制
+
+在 `src/llm.py` 的 `QwenActionExtractor` 中：
+
+- 最多重试 `LLM_MAX_RETRIES`
+- 默认 3 次
+- 指数退避：
+  - 第 1 次失败后 sleep 0.5s
+  - 第 2 次失败后 sleep 1s
+  - 第 3 次失败后结束
+
+---
+
+## 4. 修复式重试
+
+如果不是合法 JSON：
+
+系统会把：
+
+```text
+原始任务
+上一次错误输出
+解析错误原因
+```
+
+重新拼成修复 Prompt，再让模型输出一次合法 JSON。
+
+---
+
+## 5. 最终降级策略
+
+如果 Qwen 多次失败，不会直接让整个接口 500，而是返回：
+
+```json
+{
+  "actions": [
+    {
+      "action_type": "NOOP",
+      "reasoning": "extraction failed after retries: ..."
+    }
+  ],
+  "clarify_question": "抱歉，系统暂时无法理解这条消息。请明确说明标的、字段和数值，例如：24长发，量改为2000。"
+}
+```
+
+这样聊天链路不会断，同时事件表里会留下 `NOOP` 和 `CLARIFY` 记录。
+
+---
+
+# 十四、后续你可以继续增强的地方
+
+这套结构已经比较完整了。下一步最值得做的是：
+
+1. **把 `/api/feedback` 的数据用于 few-shot 自动挑选**
+   - 如果某个字段经常识别错
+   - 可以把历史纠错样本作为 Qwen Prompt 的 few-shot
+
+2. **增加字段级置信度阈值**
+   - `confidence < 0.7` 不直接更新
+   - 转为 `CLARIFY`
+
+3. **增加成单快照表**
+   - 当 `trade_draft.status == confirmed`
+   - 生成 `trade_snapshot`
+   - 推送下游系统
+
+4. **增加 Feedback 状态更新接口**
+   - `PATCH /api/feedback/{feedback_id}`
+   - 把状态改成 `resolved` / `ignored`
+
+如果你需要，我下一步可以继续帮你补：
+
+1. **`PATCH /api/feedback/{feedback_id}`**
+2. **基于 feedback.db 自动生成 few-shot 的服务**
+3. **真实 Qwen 流式/非流式兼容版本**
+
