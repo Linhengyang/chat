@@ -6037,3 +6037,2574 @@ curl "http://127.0.0.1:8000/api/sessions/session_xxx/feedback"
 2. **基于 feedback.db 自动生成 few-shot 的服务**
 3. **真实 Qwen 流式/非流式兼容版本**
 
+
+---
+🙋**user**:
+---
+```
+帮我解读你给出的代码。要求：
+给出一次消息处理流程, 特别标注涉及的model, 以及哪个.py文件的哪个函数
+```
+
+---
+🤖**assistant**:
+---
+
+下面我按**一次消息处理流程**，从请求进入到响应返回，完整解读这份代码。
+
+我会重点标注：
+
+1. **当前处理到哪一步**
+2. **涉及哪个 Pydantic model**
+3. **发生在哪个 `.py` 文件**
+4. **调用的是哪个函数**
+
+---
+
+# 一、整体流程总览
+
+一次消息处理的主链路是：
+
+```text
+前端发送消息
+    |
+    v
+FastAPI 路由接收请求
+    |
+    v
+解析请求体为 IncomingMessage
+    |
+    v
+进入主流程 service.process_message()
+    |
+    v
+SessionResolver 解析/创建 session
+    |
+    v
+消息落盘 messages
+    |
+    v
+读取当前 session 的 trade_drafts
+    |
+    v
+读取近期 messages 历史
+    |
+    v
+ActionExtractor 生成 LLMActionsResponse
+    |
+    v
+如果是 Qwen：
+    调用 Qwen API -> JSON 修复 -> 结构化校验
+    |
+    v
+逐个执行 Action
+    |
+    v
+更新 trade_drafts
+    |
+    v
+写入 draft_events
+    |
+    v
+返回 ProcessResult
+```
+
+---
+
+# 二、逐层详细流程
+
+## 0. 服务启动阶段
+
+服务启动时，FastAPI 会执行 `main.py`。
+
+### 文件
+
+`main.py`
+
+### 函数
+
+`lifespan(app)`
+
+### 做了什么
+
+启动时初始化两个 SQLite 数据库：
+
+```python
+init_db()
+init_feedback_db()
+```
+
+### 涉及文件
+
+| 文件 | 函数 | 作用 |
+|---|---|---|
+| `src/db.py` | `init_db()` | 初始化主业务数据库 `data/app.db` |
+| `src/feedback_store.py` | `init_feedback_db()` | 初始化反馈数据库 `data/feedback.db` |
+
+### 涉及数据表
+
+主库 `data/app.db`：
+
+```text
+sessions
+messages
+trade_drafts
+draft_events
+```
+
+反馈库 `data/feedback.db`：
+
+```text
+feedback
+```
+
+---
+
+# 三、一次消息处理流程
+
+假设前端发送：
+
+```json
+{
+  "sender_id": "trader_A",
+  "receiver_id": "trader_B",
+  "channel": "qq",
+  "content": "24长发和25诚通有量吗？"
+}
+```
+
+注意这里：
+
+> **前端没有传 `session_id`。**
+
+---
+
+## 1. FastAPI 接收请求
+
+### 请求路径
+
+```http
+POST /api/messages
+```
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+api_process_message()
+```
+
+### 代码位置
+
+```python
+@router.post("/messages", response_model=ProcessResult)
+def api_process_message(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+    extractor: ActionExtractor = Depends(get_extractor),
+):
+    return process_message(
+        message=payload,
+        resolver=resolver,
+        extractor=extractor,
+    )
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `IncomingMessage` | FastAPI 将请求体校验为这个模型 |
+| `ProcessResult` | 接口最终返回模型 |
+
+### 涉及文件
+
+| 文件 | 内容 |
+|---|---|
+| `src/api.py` | 路由入口 |
+| `src/models.py` | 定义 `IncomingMessage` 和 `ProcessResult` |
+| `src/session_resolver.py` | 提供 `SessionResolver` |
+| `src/llm.py` | 提供 `ActionExtractor` |
+
+---
+
+## 2. 注入依赖
+
+在进入 `api_process_message()` 时，FastAPI 会先解析两个依赖。
+
+### 2.1 获取 SessionResolver
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+get_session_resolver()
+```
+
+### 返回对象
+
+```python
+DefaultSessionResolver()
+```
+
+### 来自文件
+
+`src/session_resolver.py`
+
+### 类型
+
+```python
+SessionResolver
+```
+
+### 2.2 获取 ActionExtractor
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+get_extractor()
+```
+
+### 实际调用
+
+`src/llm.py`
+
+### 函数
+
+```python
+get_action_extractor()
+```
+
+### 逻辑
+
+```python
+if LLM_PROVIDER == "mock":
+    return MockActionExtractor()
+
+if LLM_PROVIDER == "qwen":
+    return QwenActionExtractor()
+```
+
+### 涉及文件
+
+| 文件 | 函数 |
+|---|---|
+| `src/api.py` | `get_extractor()` |
+| `src/llm.py` | `get_action_extractor()` |
+
+### 可能返回对象
+
+| 对象 | 类 |
+|---|---|
+| Mock 模式 | `MockActionExtractor` |
+| Qwen 模式 | `QwenActionExtractor` |
+
+---
+
+## 3. 进入主流程
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 入参
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `message` | `IncomingMessage` | 前端传来的原始消息 |
+| `resolver` | `SessionResolver` | 会话解析器 |
+| `extractor` | `ActionExtractor` | 增量动作抽取器 |
+
+### 返回
+
+| 类型 | 说明 |
+|---|---|
+| `ProcessResult` | 本次消息处理结果 |
+
+### 涉及 Pydantic model
+
+| Model | 文件 |
+|---|---|
+| `IncomingMessage` | `src/models.py` |
+| `ProcessResult` | `src/models.py` |
+| `Session` | `src/models.py` |
+| `TradeDraft` | `src/models.py` |
+| `Action` | `src/models.py` |
+
+---
+
+## 4. 打开数据库事务
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 关键代码
+
+```python
+with get_db() as conn:
+    ...
+```
+
+### 调用文件
+
+`src/db.py`
+
+### 函数
+
+```python
+get_db()
+```
+
+### 作用
+
+获取一个 SQLite 连接，进入事务上下文。
+
+如果流程正常：
+
+```python
+conn.commit()
+```
+
+如果流程异常：
+
+```python
+conn.rollback()
+```
+
+### 涉及数据库
+
+```text
+data/app.db
+```
+
+---
+
+## 5. SessionResolver 解析 session
+
+这是整个流程中非常关键的一步。
+
+因为前端不传 `session_id`，所以后端必须自己判断：
+
+> 这条消息属于哪一次交易协商上下文？
+
+---
+
+### 5.1 调用 resolver.resolve()
+
+### 文件
+
+`src/service.py`
+
+### 代码
+
+```python
+session = resolver.resolve(conn, message)
+```
+
+### 实际执行
+
+`src/session_resolver.py`
+
+### 类
+
+```python
+DefaultSessionResolver
+```
+
+### 函数
+
+```python
+resolve()
+```
+
+---
+
+### 5.2 生成 conversation_key
+
+`DefaultSessionResolver.resolve()` 内部首先调用：
+
+```python
+key = self.conversation_key(message)
+```
+
+### 文件
+
+`src/session_resolver.py`
+
+### 函数
+
+```python
+conversation_key()
+```
+
+### 规则
+
+如果有 `group_id`：
+
+```text
+{channel}:group:{group_id}
+```
+
+如果是私聊：
+
+```text
+{channel}:private:{sorted(sender_id, receiver_id)}
+```
+
+如果没有 `receiver_id`：
+
+```text
+{channel}:private:{sender_id}
+```
+
+### 示例
+
+```text
+qq:group:8899
+qq:private:trader_A:trader_B
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `IncomingMessage` | 提供 `sender_id`、`receiver_id`、`group_id`、`channel` |
+
+---
+
+### 5.3 查找活跃 session
+
+### 文件
+
+`src/session_resolver.py`
+
+### 函数
+
+```python
+DefaultSessionResolver.resolve()
+```
+
+### 内部调用
+
+`src/state_store.py`
+
+### 函数
+
+```python
+find_active_session()
+```
+
+### 逻辑
+
+根据：
+
+```text
+conversation_key
+```
+
+以及：
+
+```text
+SESSION_TIMEOUT_MINUTES
+```
+
+查找最近是否有活跃会话。
+
+### 涉及数据表
+
+```text
+sessions
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `Session` | 查询到活跃会话时返回 |
+
+---
+
+### 5.4 如果没有活跃 session，则创建新 session
+
+### 文件
+
+`src/session_resolver.py`
+
+### 函数
+
+```python
+DefaultSessionResolver.resolve()
+```
+
+### 内部调用
+
+`src/state_store.py`
+
+### 函数
+
+```python
+create_session()
+```
+
+### 逻辑
+
+生成：
+
+```text
+session_id
+```
+
+写入：
+
+```text
+sessions
+```
+
+### 涉及函数
+
+| 文件 | 函数 | 作用 |
+|---|---|---|
+| `src/state_store.py` | `new_id()` | 生成 `session_xxx` |
+| `src/state_store.py` | `utcnow()` | 当前时间 |
+| `src/state_store.py` | `iso()` | 时间转字符串 |
+| `src/state_store.py` | `create_session()` | 插入 session |
+| `src/state_store.py` | `get_session()` | 回查刚创建的 session |
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `Session` | 返回创建后的会话对象 |
+
+---
+
+## 6. 消息落盘
+
+拿到 `session` 后，当前消息会被写入 `messages` 表。
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+message_id = state_store.upsert_message(
+    conn,
+    message=message,
+    session_id=session.session_id,
+)
+```
+
+### 实际执行
+
+`src/state_store.py`
+
+### 函数
+
+```python
+upsert_message()
+```
+
+### 逻辑
+
+如果 `message.message_id` 为空：
+
+```python
+message_id = new_id("msg")
+```
+
+如果 `message.ts` 为空：
+
+```python
+ts = utcnow()
+```
+
+然后写入：
+
+```text
+messages
+```
+
+### 涉及数据表
+
+```text
+messages
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `IncomingMessage` | 原始消息输入 |
+| `MessageRecord` | 数据库中消息记录对应的模型 |
+
+### 涉及函数
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `upsert_message()` |
+| `src/state_store.py` | `new_id()` |
+| `src/state_store.py` | `utcnow()` |
+| `src/state_store.py` | `iso()` |
+
+---
+
+## 7. 读取当前 session 的交易草稿
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+drafts = state_store.list_drafts(conn, session.session_id)
+```
+
+### 实际执行
+
+`src/state_store.py`
+
+### 函数
+
+```python
+list_drafts()
+```
+
+### 逻辑
+
+从：
+
+```text
+trade_drafts
+```
+
+读取当前 `session_id` 下的所有交易草稿。
+
+### 涉及数据表
+
+```text
+trade_drafts
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `TradeDraft` | 表示一笔交易草稿 |
+| `SlotState` | 表示 `TradeDraft.slots` 中每个字段状态 |
+
+### 涉及函数
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `list_drafts()` |
+| `src/state_store.py` | `row_to_draft()` |
+
+### 重点说明
+
+`trade_drafts.slots_json` 会被解析成：
+
+```python
+Dict[str, SlotState]
+```
+
+例如：
+
+```json
+{
+  "amount": {
+    "value": 2000,
+    "status": "proposed",
+    "source_message_id": "msg_xxx"
+  }
+}
+```
+
+---
+
+## 8. 读取近期历史消息
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+history = state_store.list_recent_messages(
+    conn,
+    session_id=session.session_id,
+    limit=20,
+)
+```
+
+### 实际执行
+
+`src/state_store.py`
+
+### 函数
+
+```python
+list_recent_messages()
+```
+
+### 逻辑
+
+从 `messages` 表中读取当前 `session_id` 下最近的消息。
+
+### 涉及数据表
+
+```text
+messages
+```
+
+### 涉及 Pydantic model
+
+| Model | 作用 |
+|---|---|
+| `MessageRecord` | 历史消息记录 |
+
+### 涉及函数
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `list_recent_messages()` |
+| `src/state_store.py` | `row_to_message()` |
+
+---
+
+## 9. ActionExtractor 开始增量理解
+
+现在系统已经拿到三块信息：
+
+```text
+1. 当前 session
+2. 当前 drafts
+3. 最近 history
+4. 最新 message
+```
+
+接下来调用：
+
+```python
+llm_result = extractor.extract(...)
+```
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 调用对象
+
+```python
+ActionExtractor
+```
+
+### 返回类型
+
+| Model | 作用 |
+|---|---|
+| `LLMActionsResponse` | LLM 或 Mock 输出的动作结果 |
+
+---
+
+# 四、Mock 模式下的处理流程
+
+如果：
+
+```bash
+LLM_PROVIDER=mock
+```
+
+则：
+
+```python
+extractor = MockActionExtractor()
+```
+
+---
+
+## 10. MockActionExtractor.extract()
+
+### 文件
+
+`src/llm.py`
+
+### 类
+
+```python
+MockActionExtractor
+```
+
+### 函数
+
+```python
+extract()
+```
+
+### 输入
+
+| 参数 | Model |
+|---|---|
+| `session` | `Session` |
+| `drafts` | `List[TradeDraft]` |
+| `history` | `List[MessageRecord]` |
+| `message` | `IncomingMessage` |
+
+### 输出
+
+| Model |
+|---|
+| `LLMActionsResponse` |
+
+---
+
+## 11. Mock 内部做了哪些判断？
+
+### 11.1 抽取资产名
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+_extract_asset_names()
+```
+
+### 示例
+
+输入：
+
+```text
+24长发和25诚通有量吗？
+```
+
+可能抽到：
+
+```text
+24长发
+25诚通
+```
+
+### 11.2 判断是否已有该资产
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+_name_exists()
+```
+
+### 11.3 判断是否需要创建交易草稿
+
+如果当前没有草稿，或者出现“另外、新、还有”等词，则生成：
+
+```python
+ActionType.CREATE
+```
+
+### 11.4 构建定位目标
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+_build_target()
+```
+
+### 会识别
+
+```text
+前者
+后者
+第一笔
+第二笔
+这笔
+那笔
+资产名
+代码
+```
+
+### 输出模型
+
+| Model | 作用 |
+|---|---|
+| `ActionTarget` | 表示模型对某笔草稿的定位线索 |
+
+### 11.5 抽取数值字段
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+| 函数 | 作用 |
+|---|---|
+| `_extract_amount()` | 抽取数量 |
+| `_extract_price()` | 抽取价格 |
+
+### 11.6 生成动作
+
+可能生成：
+
+```text
+CREATE
+UPDATE
+CONFIRM
+REJECT
+CLARIFY
+```
+
+### 输出模型
+
+| Model |
+|---|
+| `LLMActionsResponse` |
+
+---
+
+# 五、Qwen 模式下的处理流程
+
+如果：
+
+```bash
+LLM_PROVIDER=qwen
+```
+
+则：
+
+```python
+extractor = QwenActionExtractor()
+```
+
+---
+
+## 12. QwenActionExtractor.extract()
+
+### 文件
+
+`src/llm.py`
+
+### 类
+
+```python
+QwenActionExtractor
+```
+
+### 函数
+
+```python
+extract()
+```
+
+### 输入
+
+| 参数 | Model |
+|---|---|
+| `session` | `Session` |
+| `drafts` | `List[TradeDraft]` |
+| `history` | `List[MessageRecord]` |
+| `message` | `IncomingMessage` |
+
+### 输出
+
+| Model |
+|---|
+| `LLMActionsResponse` |
+
+---
+
+## 13. 构建 Prompt
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+build_prompt()
+```
+
+### 输入
+
+| 参数 | Model |
+|---|---|
+| `session` | `Session` |
+| `drafts` | `List[TradeDraft]` |
+| `history` | `List[MessageRecord]` |
+| `message` | `IncomingMessage` |
+
+### 输出
+
+```text
+prompt string
+```
+
+### Prompt 中包含的内容
+
+```json
+{
+  "session": {
+    "session_id": "...",
+    "status": "..."
+  },
+  "current_drafts": [],
+  "recent_history": [],
+  "latest_message": {}
+}
+```
+
+### 对应关系
+
+| Prompt 字段 | 来源模型 |
+|---|---|
+| `session` | `Session` |
+| `current_drafts` | `TradeDraft` |
+| `recent_history` | `MessageRecord` |
+| `latest_message` | `IncomingMessage` |
+
+---
+
+## 14. 调用 Qwen API
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+QwenActionExtractor.extract()
+```
+
+内部调用：
+
+```python
+call_qwen_api(current_prompt)
+```
+
+### 实际执行
+
+`src/llm.py`
+
+### 函数
+
+```python
+call_qwen_api()
+```
+
+### 内部继续调用
+
+```python
+_post_qwen()
+```
+
+### 涉及配置
+
+来自：
+
+`src/config.py`
+
+| 配置 | 作用 |
+|---|---|
+| `QWEN_API_URL` | Qwen API 地址 |
+| `QWEN_API_KEY` | API Key |
+| `QWEN_MODEL` | 模型名 |
+| `QWEN_TIMEOUT_SECONDS` | 超时时间 |
+| `QWEN_USE_RESPONSE_FORMAT` | 是否使用 `response_format=json_object` |
+
+### 返回
+
+```text
+LLM 原始字符串输出
+```
+
+---
+
+## 15. JSON 修复
+
+LLM 原始输出可能不是严格 JSON，例如：
+
+```text
+```json
+{
+  "actions": []
+}
+```
+```
+
+或者：
+
+```text
+好的，这是结果：
+{"actions": []}
+```
+
+这时需要修复。
+
+### 文件
+
+`src/json_utils.py`
+
+### 主函数
+
+```python
+robust_json_loads()
+```
+
+### 内部调用
+
+| 函数 | 作用 |
+|---|---|
+| `strip_markdown_fences()` | 去掉 ```json |
+| `extract_outermost_json()` | 从混杂文本中抽出 JSON |
+| `remove_comments()` | 去除注释 |
+| `normalize_chinese_quotes()` | 中文引号转普通引号 |
+| `normalize_python_literals()` | `True/False/None` 转 `true/false/null` |
+| `quote_unquoted_keys()` | 给无引号 key 加引号 |
+| `remove_trailing_commas()` | 去掉尾逗号 |
+| `replace_single_quotes()` | 单引号兜底转双引号 |
+
+### 输出
+
+```python
+dict
+```
+
+---
+
+## 16. 结构化校验
+
+### 文件
+
+`src/parsing.py`
+
+### 函数
+
+```python
+parse_llm_actions()
+```
+
+### 内部调用
+
+```python
+robust_json_loads()
+```
+
+### 作用
+
+把 LLM 原始输出解析成：
+
+```python
+LLMActionsResponse
+```
+
+### 涉及 Model
+
+| Model | 作用 |
+|---|---|
+| `LLMActionsResponse` | 最终结构化动作结果 |
+| `Action` | 单个动作 |
+| `ActionTarget` | 动作目标 |
+| `ActionType` | 动作类型枚举 |
+
+---
+
+## 17. 清洗 Action
+
+### 文件
+
+`src/parsing.py`
+
+### 函数
+
+```python
+parse_llm_actions()
+```
+
+内部会调用：
+
+```python
+_sanitize_action()
+_sanitize_target()
+```
+
+### 做的事情
+
+#### 17.1 过滤空目标
+
+如果 `ActionTarget` 没有任何有效信息，则置空。
+
+#### 17.2 白名单字段过滤
+
+只允许更新：
+
+```text
+asset_name
+asset_code
+direction
+amount
+price
+```
+
+#### 17.3 过滤无意义 UPDATE
+
+如果：
+
+```python
+action_type == UPDATE
+```
+
+但是：
+
+```python
+updates == {}
+```
+
+则删除该动作。
+
+#### 17.4 补全 CREATE
+
+如果：
+
+```python
+action_type == CREATE
+```
+
+但是 `updates` 没有 `asset_name`，而 `target.asset_name` 有，则自动补上。
+
+---
+
+## 18. Qwen 重试机制
+
+### 文件
+
+`src/llm.py`
+
+### 类
+
+```python
+QwenActionExtractor
+```
+
+### 函数
+
+```python
+extract()
+```
+
+### 逻辑
+
+最多重试：
+
+```python
+config.LLM_MAX_RETRIES
+```
+
+默认 3 次。
+
+### 每次失败后
+
+如果不是最后一次，则指数退避：
+
+```python
+sleep_seconds = 0.5 * (2 ** (attempt - 1))
+time.sleep(sleep_seconds)
+```
+
+### 如果失败原因是解析失败
+
+下一次会调用：
+
+```python
+build_repair_prompt()
+```
+
+### 文件
+
+`src/llm.py`
+
+### 函数
+
+```python
+build_repair_prompt()
+```
+
+### 输入
+
+| 参数 | 说明 |
+|---|---|
+| `base_prompt` | 原始任务 Prompt |
+| `bad_output` | 模型上次错误输出 |
+| `error_message` | 解析错误原因 |
+
+### 作用
+
+让模型重新输出合法 JSON。
+
+---
+
+## 19. Qwen 最终降级
+
+如果重试全部失败：
+
+### 文件
+
+`src/llm.py`
+
+### 类
+
+```python
+QwenActionExtractor
+```
+
+### 函数
+
+```python
+extract()
+```
+
+### 返回
+
+```python
+LLMActionsResponse(
+    actions=[
+        Action(
+            action_type=ActionType.NOOP,
+            reasoning="extraction failed after retries: ..."
+        )
+    ],
+    clarify_question="抱歉，系统暂时无法理解这条消息..."
+)
+```
+
+### 涉及 Model
+
+| Model |
+|---|
+| `LLMActionsResponse` |
+| `Action` |
+| `ActionType` |
+
+### 作用
+
+避免接口直接 500，保证聊天链路不断。
+
+---
+
+# 六、回到主流程：执行 Actions
+
+现在 `process_message()` 拿到了：
+
+```python
+llm_result: LLMActionsResponse
+```
+
+---
+
+## 20. 初始化 clarify_question
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+clarify_question = llm_result.clarify_question
+```
+
+### 涉及 Model
+
+| Model |
+|---|
+| `LLMActionsResponse` |
+
+---
+
+## 21. 遍历执行每个 Action
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+for action in llm_result.actions:
+    local_clarify = apply_action(...)
+```
+
+### 调用函数
+
+```python
+apply_action()
+```
+
+### 涉及 Model
+
+| Model | 作用 |
+|---|---|
+| `Action` | 当前要执行的动作 |
+| `TradeDraft` | 当前 session 下的草稿列表 |
+| `ActionTarget` | 动作目标 |
+
+---
+
+# 七、apply_action() 详细流程
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+apply_action()
+```
+
+### 作用
+
+根据一个 `Action`，实际更新数据库中的 `trade_draft`。
+
+---
+
+## 22. 构造定位目标
+
+### 函数
+
+```python
+apply_action()
+```
+
+内部调用：
+
+```python
+_get_lookup_target(action)
+```
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+_get_lookup_target()
+```
+
+### 作用
+
+从：
+
+```python
+action.target
+```
+
+和：
+
+```python
+action.updates
+```
+
+合并出一个用于查找草稿的 `ActionTarget`。
+
+### 涉及 Model
+
+| Model |
+|---|
+| `Action` |
+| `ActionTarget` |
+
+---
+
+## 23. 解析目标草稿
+
+### 函数
+
+```python
+resolve_target()
+```
+
+### 文件
+
+`src/service.py`
+
+### 输入
+
+| 参数 | Model |
+|---|---|
+| `drafts` | `List[TradeDraft]` |
+| `target` | `ActionTarget` |
+
+### 输出
+
+| 类型 |
+|---|
+| `Optional[TradeDraft]` |
+
+### 匹配顺序
+
+1. `target.draft_id`
+2. `target.asset_name`
+3. `target.asset_code`
+4. `target.ordinal`
+5. `target.reference_expression`
+
+### 能处理的指代
+
+```text
+前者
+后者
+第一笔
+第二笔
+这笔
+那笔
+```
+
+---
+
+## 24. 如果 Action 是 CREATE
+
+### 分支
+
+```python
+if action.action_type == ActionType.CREATE:
+```
+
+### 逻辑
+
+如果目标草稿已经存在：
+
+```python
+state_store.update_draft_fields()
+```
+
+如果不存在：
+
+```python
+state_store.create_draft()
+```
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+| 函数 | 作用 |
+|---|---|
+| `create_draft()` | 创建新草稿 |
+| `update_draft_fields()` | 更新已有草稿字段 |
+
+### 涉及数据表
+
+```text
+trade_drafts
+draft_events
+```
+
+### 涉及 Model
+
+| Model |
+|---|
+| `TradeDraft` |
+| `SlotState` |
+| `DraftEvent` |
+
+---
+
+## 25. 如果 Action 是 UPDATE
+
+### 分支
+
+```python
+if action.action_type == ActionType.UPDATE:
+```
+
+### 逻辑
+
+1. 查找目标草稿
+2. 如果找不到，并且当前只有一笔草稿，则默认更新唯一草稿
+3. 如果仍然找不到，则返回 clarify
+4. 如果目标草稿已经确认，则不允许直接修改
+5. 调用：
+
+```python
+state_store.update_draft_fields()
+```
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+```python
+update_draft_fields()
+```
+
+### 作用
+
+更新字段，并写入事件。
+
+### 涉及数据表
+
+```text
+trade_drafts
+draft_events
+```
+
+### 涉及 Model
+
+| Model | 作用 |
+|---|---|
+| `TradeDraft` | 被更新对象 |
+| `SlotState` | 字段级状态 |
+| `DraftEvent` | 状态变更事件 |
+
+---
+
+## 26. 如果 Action 是 CONFIRM / REJECT / CANCEL
+
+### 分支
+
+```python
+if action.action_type in (
+    ActionType.CONFIRM,
+    ActionType.REJECT,
+    ActionType.CANCEL,
+):
+```
+
+### 逻辑
+
+1. 查找目标草稿
+2. 如果找不到，并且只有一笔草稿，则默认操作唯一草稿
+3. 如果仍然找不到，则返回 clarify
+4. 调用：
+
+```python
+state_store.set_draft_status()
+```
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+```python
+set_draft_status()
+```
+
+### 状态映射
+
+| Action | Draft 状态 |
+|---|---|
+| `CONFIRM` | `confirmed` |
+| `REJECT` | `rejected` |
+| `CANCEL` | `cancelled` |
+
+### 涉及数据表
+
+```text
+trade_drafts
+draft_events
+```
+
+---
+
+## 27. 如果 Action 是 CLARIFY
+
+### 分支
+
+```python
+if action.action_type == ActionType.CLARIFY:
+```
+
+### 逻辑
+
+写入事件：
+
+```python
+state_store.append_event()
+```
+
+然后返回需要反问的问题。
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+```python
+append_event()
+```
+
+### 涉及数据表
+
+```text
+draft_events
+```
+
+---
+
+## 28. 如果 Action 是 NOOP
+
+### 分支
+
+```python
+if action.action_type == ActionType.NOOP:
+```
+
+### 逻辑
+
+只写事件，不改变草稿。
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+```python
+append_event()
+```
+
+---
+
+# 八、执行完 Actions 后
+
+回到：
+
+`src/service.py`
+
+函数：
+
+```python
+process_message()
+```
+
+---
+
+## 29. 如果 LLM 返回了 clarify_question
+
+### 代码
+
+```python
+if llm_result.clarify_question:
+    state_store.append_event(...)
+```
+
+### 文件
+
+`src/state_store.py`
+
+### 函数
+
+```python
+append_event()
+```
+
+### 作用
+
+把反问也记录到：
+
+```text
+draft_events
+```
+
+---
+
+## 30. 刷新 session 活跃时间
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+state_store.touch_session(conn, session.session_id)
+```
+
+### 实际执行
+
+`src/state_store.py`
+
+### 函数
+
+```python
+touch_session()
+```
+
+### 作用
+
+更新：
+
+```text
+sessions.updated_at
+sessions.expired_at
+```
+
+### 涉及数据表
+
+```text
+sessions
+```
+
+---
+
+## 31. 重新读取最新状态
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 代码
+
+```python
+session = state_store.get_session(conn, session.session_id)
+drafts = state_store.list_drafts(conn, session.session_id)
+```
+
+### 实际执行
+
+`src/state_store.py`
+
+### 函数
+
+| 函数 | 作用 |
+|---|---|
+| `get_session()` | 查询最新 session |
+| `list_drafts()` | 查询最新 drafts |
+
+### 涉及 Model
+
+| Model |
+|---|
+| `Session` |
+| `TradeDraft` |
+
+---
+
+## 32. 返回 ProcessResult
+
+### 文件
+
+`src/service.py`
+
+### 函数
+
+```python
+process_message()
+```
+
+### 返回
+
+```python
+ProcessResult(
+    session=session,
+    drafts=drafts,
+    actions=llm_result.actions,
+    clarify_question=clarify_question,
+    message_id=message_id,
+)
+```
+
+### 涉及 Model
+
+| Model | 作用 |
+|---|---|
+| `ProcessResult` | 最终接口返回 |
+| `Session` | 当前会话 |
+| `TradeDraft` | 当前草稿列表 |
+| `Action` | 本次模型生成的动作 |
+
+---
+
+## 33. FastAPI 返回响应
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+api_process_message()
+```
+
+### 返回模型
+
+```python
+ProcessResult
+```
+
+### 响应示例
+
+```json
+{
+  "session": {
+    "session_id": "session_xxx",
+    "conversation_key": "qq:private:trader_A:trader_B",
+    "channel": "qq",
+    "status": "negotiating"
+  },
+  "drafts": [],
+  "actions": [],
+  "clarify_question": null,
+  "message_id": "msg_xxx"
+}
+```
+
+---
+
+# 九、一次完整调用链速查表
+
+下面是一次消息处理完整链路。
+
+| 步骤 | 文件 | 函数 | 涉及 Model | 作用 |
+|---|---|---|---|---|
+| 1 | `src/api.py` | `api_process_message()` | `IncomingMessage`, `ProcessResult` | 接收请求 |
+| 2 | `src/api.py` | `get_session_resolver()` | `SessionResolver` | 注入会话解析器 |
+| 3 | `src/api.py` | `get_extractor()` | `ActionExtractor` | 注入动作抽取器 |
+| 4 | `src/llm.py` | `get_action_extractor()` | `ActionExtractor` | 根据配置返回 Mock 或 Qwen |
+| 5 | `src/service.py` | `process_message()` | `IncomingMessage`, `ProcessResult` | 主流程 |
+| 6 | `src/db.py` | `get_db()` | 无 | 打开 SQLite 事务 |
+| 7 | `src/session_resolver.py` | `DefaultSessionResolver.resolve()` | `IncomingMessage`, `Session` | 解析/创建 session |
+| 8 | `src/session_resolver.py` | `conversation_key()` | `IncomingMessage` | 生成会话键 |
+| 9 | `src/state_store.py` | `find_active_session()` | `Session` | 查找活跃 session |
+| 10 | `src/state_store.py` | `create_session()` | `Session` | 创建新 session |
+| 11 | `src/state_store.py` | `upsert_message()` | `IncomingMessage`, `MessageRecord` | 消息落盘 |
+| 12 | `src/state_store.py` | `list_drafts()` | `TradeDraft`, `SlotState` | 读取当前草稿 |
+| 13 | `src/state_store.py` | `list_recent_messages()` | `MessageRecord` | 读取历史消息 |
+| 14 | `src/llm.py` | `ActionExtractor.extract()` | `LLMActionsResponse` | 生成增量动作 |
+| 15 | `src/llm.py` | `MockActionExtractor.extract()` | `Action`, `ActionTarget`, `LLMActionsResponse` | Mock 规则抽取 |
+| 16 | `src/llm.py` | `QwenActionExtractor.extract()` | `Action`, `LLMActionsResponse` | Qwen 抽取 |
+| 17 | `src/llm.py` | `build_prompt()` | `Session`, `TradeDraft`, `MessageRecord`, `IncomingMessage` | 构造 Prompt |
+| 18 | `src/llm.py` | `call_qwen_api()` | 无 | 调用 Qwen |
+| 19 | `src/json_utils.py` | `robust_json_loads()` | 无 | JSON 修复和解析 |
+| 20 | `src/parsing.py` | `parse_llm_actions()` | `LLMActionsResponse`, `Action`, `ActionTarget` | 结构化校验 |
+| 21 | `src/service.py` | `apply_action()` | `Action`, `TradeDraft` | 执行动作 |
+| 22 | `src/service.py` | `resolve_target()` | `TradeDraft`, `ActionTarget` | 定位目标草稿 |
+| 23 | `src/state_store.py` | `create_draft()` | `TradeDraft`, `SlotState`, `DraftEvent` | 创建草稿 |
+| 24 | `src/state_store.py` | `update_draft_fields()` | `TradeDraft`, `SlotState`, `DraftEvent` | 更新草稿字段 |
+| 25 | `src/state_store.py` | `set_draft_status()` | `TradeDraft`, `DraftEvent` | 更新草稿状态 |
+| 26 | `src/state_store.py` | `append_event()` | `DraftEvent` | 写事件 |
+| 27 | `src/state_store.py` | `touch_session()` | `Session` | 刷新 session 活跃时间 |
+| 28 | `src/service.py` | `process_message()` | `ProcessResult` | 返回最终结果 |
+
+---
+
+# 十、核心 Model 在流程中的位置
+
+## 1. IncomingMessage
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+前端请求体。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/api.py` | `api_process_message()` |
+| `src/service.py` | `process_message()` |
+| `src/session_resolver.py` | `resolve()` |
+| `src/state_store.py` | `upsert_message()` |
+| `src/llm.py` | `extract()` |
+
+---
+
+## 2. Session
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示一次交易协商上下文。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/session_resolver.py` | `resolve()` |
+| `src/state_store.py` | `create_session()` |
+| `src/state_store.py` | `find_active_session()` |
+| `src/service.py` | `process_message()` |
+| `src/llm.py` | `build_prompt()` |
+
+---
+
+## 3. MessageRecord
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示已经落盘的消息。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `upsert_message()` |
+| `src/state_store.py` | `list_recent_messages()` |
+| `src/llm.py` | `extract()` |
+| `src/llm.py` | `build_prompt()` |
+
+---
+
+## 4. TradeDraft
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示一笔交易草稿。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `list_drafts()` |
+| `src/state_store.py` | `create_draft()` |
+| `src/state_store.py` | `update_draft_fields()` |
+| `src/service.py` | `apply_action()` |
+| `src/service.py` | `resolve_target()` |
+| `src/llm.py` | `build_prompt()` |
+
+---
+
+## 5. SlotState
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示交易草稿中某个字段的状态。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `row_to_draft()` |
+| `src/state_store.py` | `create_draft()` |
+| `src/state_store.py` | `update_draft_fields()` |
+
+---
+
+## 6. ActionTarget
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示模型如何定位某笔交易草稿。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/llm.py` | `_build_target()` |
+| `src/parsing.py` | `_sanitize_target()` |
+| `src/service.py` | `_get_lookup_target()` |
+| `src/service.py` | `resolve_target()` |
+
+---
+
+## 7. Action
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示一次增量操作。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/llm.py` | `MockActionExtractor.extract()` |
+| `src/llm.py` | `QwenActionExtractor.extract()` |
+| `src/parsing.py` | `_sanitize_action()` |
+| `src/service.py` | `apply_action()` |
+
+---
+
+## 8. LLMActionsResponse
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示模型最终输出的一组动作。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/llm.py` | `extract()` |
+| `src/parsing.py` | `parse_llm_actions()` |
+| `src/service.py` | `process_message()` |
+
+---
+
+## 9. DraftEvent
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+表示状态变化审计记录。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/state_store.py` | `append_event()` |
+| `src/state_store.py` | `row_to_event()` |
+| `src/api.py` | `api_get_session_events()` |
+
+---
+
+## 10. ProcessResult
+
+### 定义位置
+
+`src/models.py`
+
+### 作用
+
+接口最终返回。
+
+### 出现在
+
+| 文件 | 函数 |
+|---|---|
+| `src/api.py` | `api_process_message()` |
+| `src/service.py` | `process_message()` |
+
+---
+
+# 十一、用一个具体例子走一遍
+
+输入：
+
+```json
+{
+  "sender_id": "trader_A",
+  "receiver_id": "trader_B",
+  "channel": "qq",
+  "content": "24长发和25诚通有量吗？"
+}
+```
+
+---
+
+## 第一步：API 接收
+
+`src/api.py`
+
+```python
+api_process_message()
+```
+
+解析为：
+
+```python
+IncomingMessage
+```
+
+---
+
+## 第二步：进入主流程
+
+`src/service.py`
+
+```python
+process_message()
+```
+
+---
+
+## 第三步：解析 session
+
+`src/session_resolver.py`
+
+```python
+DefaultSessionResolver.resolve()
+```
+
+生成：
+
+```text
+conversation_key = qq:private:trader_A:trader_B
+```
+
+---
+
+## 第四步：查找/创建 session
+
+`src/state_store.py`
+
+```python
+find_active_session()
+create_session()
+```
+
+返回：
+
+```python
+Session
+```
+
+---
+
+## 第五步：消息落盘
+
+`src/state_store.py`
+
+```python
+upsert_message()
+```
+
+写入：
+
+```text
+messages
+```
+
+---
+
+## 第六步：读取状态
+
+`src/state_store.py`
+
+```python
+list_drafts()
+list_recent_messages()
+```
+
+得到：
+
+```python
+drafts: List[TradeDraft]
+history: List[MessageRecord]
+```
+
+---
+
+## 第七步：模型抽取动作
+
+如果是 Mock：
+
+`src/llm.py`
+
+```python
+MockActionExtractor.extract()
+```
+
+如果是 Qwen：
+
+`src/llm.py`
+
+```python
+QwenActionExtractor.extract()
+```
+
+输出：
+
+```python
+LLMActionsResponse
+```
+
+---
+
+## 第八步：Qwen 模式下修复和校验
+
+如果是 Qwen：
+
+`src/json_utils.py`
+
+```python
+robust_json_loads()
+```
+
+`src/parsing.py`
+
+```python
+parse_llm_actions()
+```
+
+输出：
+
+```python
+LLMActionsResponse
+```
+
+---
+
+## 第九步：执行动作
+
+`src/service.py`
+
+```python
+apply_action()
+```
+
+可能调用：
+
+`src/state_store.py`
+
+```python
+create_draft()
+update_draft_fields()
+set_draft_status()
+append_event()
+```
+
+---
+
+## 第十步：返回结果
+
+`src/service.py`
+
+```python
+process_message()
+```
+
+返回：
+
+```python
+ProcessResult
+```
+
+---
+
+# 十二、Feedback 流程是独立的
+
+这次补上的 `/api/feedback` 不参与消息主流程。
+
+它是一个独立链路。
+
+---
+
+## 1. 创建 Feedback
+
+### 请求路径
+
+```http
+POST /api/feedback
+```
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+api_create_feedback()
+```
+
+### 请求模型
+
+```python
+FeedbackCreate
+```
+
+### 返回模型
+
+```python
+FeedbackRecord
+```
+
+---
+
+## 2. 落盘到 feedback.db
+
+### 文件
+
+`src/feedback_store.py`
+
+### 函数
+
+```python
+create_feedback()
+```
+
+### 数据库
+
+```text
+data/feedback.db
+```
+
+### 表
+
+```text
+feedback
+```
+
+---
+
+## 3. 查询 Feedback
+
+### 文件
+
+`src/api.py`
+
+### 函数
+
+```python
+api_list_feedback()
+```
+
+或者：
+
+```python
+api_get_session_feedback()
+```
+
+### 内部调用
+
+`src/feedback_store.py`
+
+```python
+list_feedback()
+```
+
+---
+
+# 十三、最核心的一句话总结
+
+这套代码的核心思想是：
+
+```text
+FastAPI 接收 IncomingMessage
+    -> SessionResolver 生成/复用 Session
+    -> state_store 读取 Session 下的 TradeDraft 和 MessageRecord
+    -> ActionExtractor 输出 LLMActionsResponse
+    -> service.apply_action 根据 Action 更新 TradeDraft
+    -> state_store 写入 DraftEvent
+    -> 返回 ProcessResult
+```
+
+其中：
+
+```text
+Session 管上下文边界
+TradeDraft 管交易实体
+SlotState 管字段状态
+Action 管增量变化
+DraftEvent 管审计追踪
+ProcessResult 管接口输出
+FeedbackRecord 管人工纠错反馈
+```
+
