@@ -8608,3 +8608,1435 @@ ProcessResult 管接口输出
 FeedbackRecord 管人工纠错反馈
 ```
 
+
+---
+🙋**user**:
+---
+```
+我仔细研读了你的代码，基本上能搞清楚在做什么了。那我现在需要的需求是:
+把你的代码逻辑做成持续不断serve的服务, 持续执行如下:
+0. 当目前session会话尚未结束时, 保持你目前的逻辑
+1. 当目前session会话结束时(大概可以等价为一个新开下一个session，或者你在这里给我留好接口), 将该session下属的所有draft, 作以下处理:
+   分析slots, 如果各个field对应的value都存在, 那么把所有proposed & confirmed状态都改成confirmed, 其他状态不动; 如果存在field欠缺, 那么将对应slot_status改成unknown.
+2. 将所有这些draft发送给前端
+
+总结一下, 其实就是在持续执行: 新开一个session时，要结算上一个session, 将其内部的所有draft的所有slots尘埃落定, proposed&confirmed都确认为confirmed, 欠缺的改成unknown, 其他不动.
+然后执行api_get_session_drafts(last_session_id), 大概是这样吧?
+```
+
+---
+🤖**assistant**:
+---
+
+你的理解**基本是对的**，但我建议把这件事抽象成一个明确的动作：
+
+> **结算 / Settle Session**
+
+也就是说，不是简单“新开一个 session 后，再调用 `api_get_session_drafts(last_session_id)`”。
+
+更合理的设计是：
+
+```text
+当旧 session 结束时：
+    1. 先结算旧 session 下所有 trade_draft
+    2. 把 proposed / confirmed 的 slot 落定为 confirmed
+    3. 把缺失字段的 slot 标记为 unknown
+    4. 返回结算后的 drafts 给前端
+    5. 再开启新 session
+```
+
+如果前端主动结束，也可以调用：
+
+```http
+POST /api/sessions/{session_id}/settle
+```
+
+如果是“超时后来了下一条消息，所以新开下一个 session”，则在 `SessionResolver` 里自动结算上一个 session。
+
+---
+
+# 一、先回答你的问题
+
+你说：
+
+> 总结一下，其实就是在持续执行：新开一个 session 时，要结算上一个 session，将其内部的所有 draft 的所有 slots 尘埃落定，proposed & confirmed 都确认为 confirmed，欠缺的改成 unknown，其他不动。然后执行 api_get_session_drafts(last_session_id)，大概是这样吧？
+
+我的建议是：
+
+## 1. “持续不断 serve 的服务”
+
+FastAPI + Uvicorn 本身就是持续运行的服务。
+
+你不需要额外写一个死循环来处理消息。
+
+```bash
+uvicorn main:app --reload
+```
+
+或者生产环境：
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+它会持续接收请求。
+
+---
+
+## 2. “新开一个 session 时结算上一个 session”
+
+这个逻辑建议放在：
+
+```text
+SessionResolver
+```
+
+里。
+
+也就是：
+
+```text
+当前消息进来
+    |
+    v
+根据会话规则判断是否还能复用当前 active session
+    |
+    +-- 如果还能复用：
+    |       保持原逻辑
+    |
+    +-- 如果不能复用，需要新开 session：
+            先找到上一个未结算 session
+            settle 上一个 session
+            创建新 session
+            返回新 session + 已结算的旧 session drafts
+```
+
+---
+
+## 3. “然后执行 api_get_session_drafts(last_session_id)”
+
+可以，但不是最优。
+
+因为 `GET /api/sessions/{session_id}/drafts` 只是查询，它不应该承担“结算”的职责。
+
+更好的方式是：
+
+```text
+结算动作本身返回 drafts
+```
+
+即：
+
+```http
+POST /api/sessions/{session_id}/settle
+```
+
+返回：
+
+```json
+{
+  "session": {},
+  "drafts": []
+}
+```
+
+或者在 `POST /api/messages` 的返回里直接带：
+
+```json
+{
+  "session": {},
+  "drafts": [],
+  "actions": [],
+  "message_id": "msg_xxx",
+  "settled_session": {},
+  "settled_drafts": []
+}
+```
+
+这样前端不需要额外再请求一次。
+
+---
+
+# 二、这次要新增的核心概念
+
+我们需要新增几个东西。
+
+---
+
+## 1. `SessionResolutionResult`
+
+原来 `SessionResolver.resolve()` 只返回：
+
+```python
+Session
+```
+
+现在不够用了。
+
+因为它可能同时发生两件事：
+
+1. 创建了新 session；
+2. 结算了旧 session。
+
+所以建议返回：
+
+```python
+SessionResolutionResult
+```
+
+包含：
+
+```python
+session: Session
+created: bool
+settled_session: Optional[Session]
+settled_drafts: List[TradeDraft]
+```
+
+---
+
+## 2. `SessionSettleResult`
+
+手动结算接口返回：
+
+```python
+SessionSettleResult
+```
+
+包含：
+
+```python
+session: Session
+drafts: List[TradeDraft]
+```
+
+---
+
+## 3. `settle_session()`
+
+这是核心业务函数。
+
+它做的事情是：
+
+```text
+找到某个 session 下所有 draft
+    |
+    v
+检查每个 draft 的必需字段是否都有值
+    |
+    +-- 如果都有值：
+    |       将所有 proposed / confirmed slot 改成 confirmed
+    |
+    +-- 如果有字段缺失：
+    |       将缺失字段的 slot_status 改成 unknown
+    |
+    v
+更新数据库
+    |
+    v
+写入结算事件
+    |
+    v
+将 session 标记为 settled
+    |
+    v
+返回最新 drafts
+```
+
+---
+
+# 三、代码修改
+
+下面按文件给出。
+
+---
+
+# 四、修改 `src/models.py`
+
+你需要新增几个模型，并且扩展 `ProcessResult`。
+
+---
+
+## 1. 替换原来的 `ProcessResult`
+
+原来大概是：
+
+```python
+class ProcessResult(BaseModel):
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+```
+
+替换成：
+
+```python
+class ProcessResult(BaseModel):
+    """
+    单次消息处理结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+
+    # 如果本次消息触发了新 session，并结算了上一个 session，
+    # 这里会返回被结算的旧 session 以及旧 session 下的所有草稿。
+    settled_session: Optional[Session] = None
+    settled_drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+---
+
+## 2. 新增 `SessionSettleResult`
+
+可以放在 `SessionDetail` 附近：
+
+```python
+class SessionSettleResult(BaseModel):
+    """
+    Session 结算结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+---
+
+## 3. 新增 `SessionResolutionResult`
+
+```python
+class SessionResolutionResult(BaseModel):
+    """
+    SessionResolver 的解析结果。
+
+    如果当前消息仍然属于活跃 session，则只返回当前 session。
+    如果当前消息触发了新 session，并且系统自动结算了上一个 session，
+    则同时返回 settled_session 和 settled_drafts。
+    """
+    session: Session
+    created: bool = False
+
+    settled_session: Optional[Session] = None
+    settled_drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+---
+
+# 五、修改 `src/state_store.py`
+
+这里新增结算逻辑。
+
+你可以在 `src/state_store.py` 末尾追加下面代码。
+
+---
+
+## 1. 定义结算必需字段
+
+```python
+# 结算时需要检查的字段。
+# 你可以根据业务改这里。
+# 例如你只要求 asset_name / amount / price 必填，可以改成：
+# REQUIRED_SETTLE_FIELDS = ("asset_name", "amount", "price")
+REQUIRED_SETTLE_FIELDS = (
+    "asset_name",
+    "asset_code",
+    "direction",
+    "amount",
+    "price",
+)
+
+# 如果你不想结算已被拒绝 / 取消的 draft，可以改成：
+# SETTLE_SKIP_DRAFT_STATUSES = {"rejected", "cancelled"}
+SETTLE_SKIP_DRAFT_STATUSES = set()
+```
+
+---
+
+## 2. 查找最近一个未结算 session
+
+```python
+def find_latest_unsettled_session(
+    conn,
+    conversation_key: str,
+) -> Optional[Session]:
+    """
+    查找当前会话键下最近一个尚未结算的 session。
+
+    用于：
+    1. 当前消息需要新开 session；
+    2. 但上一个 session 还没有显式结算；
+    3. 此时先结算上一个 session。
+    """
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        WHERE conversation_key = ?
+          AND status NOT IN ('settled', 'closed')
+        ORDER BY updated_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        (conversation_key,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+```
+
+---
+
+## 3. 判断字段是否缺失
+
+```python
+def _is_missing_value(value: Any) -> bool:
+    """
+    判断某个字段值是否缺失。
+
+    当前规则：
+    1. None 算缺失；
+    2. 空字符串算缺失；
+    3. 0 不算缺失；
+    4. False 不算缺失。
+    """
+    if value is None:
+        return True
+
+    if isinstance(value, str) and not value.strip():
+        return True
+
+    return False
+```
+
+---
+
+## 4. 结算单个 draft
+
+```python
+def settle_draft(
+    conn,
+    draft_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+) -> Optional[TradeDraft]:
+    """
+    结算单个 trade_draft。
+
+    规则：
+    1. 检查 REQUIRED_SETTLE_FIELDS 是否都有值；
+    2. 如果所有字段都有值：
+       - 将所有 proposed / confirmed 状态的 slot 改成 confirmed；
+       - 其他状态不动；
+    3. 如果存在字段缺失：
+       - 将缺失字段的 slot_status 改成 unknown；
+       - 其他已有字段状态不动。
+    """
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    slots = json.loads(row["slots_json"] or "{}")
+    now = utcnow()
+
+    missing_fields = []
+
+    for field in REQUIRED_SETTLE_FIELDS:
+        value = row[field]
+        if _is_missing_value(value):
+            missing_fields.append(field)
+
+    if missing_fields:
+        # 存在字段缺失：
+        # 只把缺失字段的 slot 标成 unknown。
+        for field in missing_fields:
+            slots[field] = SlotState(
+                value=None,
+                status="unknown",
+                source_message_id=message_id,
+                updated_at=now,
+            ).model_dump(mode="json")
+
+        settle_result = "incomplete"
+
+    else:
+        # 所有字段都有值：
+        # 先确保每个必需字段都有 slot。
+        for field in REQUIRED_SETTLE_FIELDS:
+            if field not in slots:
+                slots[field] = SlotState(
+                    value=row[field],
+                    status="confirmed",
+                    source_message_id=message_id,
+                    updated_at=now,
+                ).model_dump(mode="json")
+
+        # 将所有 proposed / confirmed 的 slot 改成 confirmed。
+        # 其他状态，例如 rejected / ambiguous / unknown，不动。
+        for slot in slots.values():
+            if slot.get("status") in {"proposed", "confirmed"}:
+                slot["status"] = "confirmed"
+                slot["updated_at"] = now.isoformat()
+
+        settle_result = "complete"
+
+    conn.execute(
+        """
+        UPDATE trade_drafts
+        SET slots_json = ?, updated_at = ?
+        WHERE draft_id = ?
+        """,
+        (
+            json.dumps(slots, ensure_ascii=False),
+            iso(now),
+            draft_id,
+        ),
+    )
+
+    append_event(
+        conn,
+        session_id=row["session_id"],
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=None,
+        new_value={
+            "settle_result": settle_result,
+            "missing_fields": missing_fields,
+        },
+        reasoning=reasoning,
+    )
+
+    return get_draft(conn, draft_id)
+```
+
+---
+
+## 5. 结算整个 session
+
+```python
+def settle_session(
+    conn,
+    session_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+) -> tuple[Session, List[TradeDraft]]:
+    """
+    结算整个 session。
+
+    流程：
+    1. 查找该 session 下所有 draft；
+    2. 逐个 settle_draft；
+    3. 将 session.status 标记为 settled；
+    4. 写入 SETTLE 事件；
+    5. 返回最新的 session 和 drafts。
+    """
+    session = get_session(conn, session_id)
+
+    if session is None:
+        raise ValueError(f"session not found: {session_id}")
+
+    # 如果已经结算过，则幂等返回。
+    if session.status in {"settled", "closed"}:
+        return session, list_drafts(conn, session_id)
+
+    drafts = list_drafts(conn, session_id)
+
+    for draft in drafts:
+        if draft.status in SETTLE_SKIP_DRAFT_STATUSES:
+            continue
+
+        settle_draft(
+            conn,
+            draft_id=draft.draft_id,
+            message_id=message_id,
+            reasoning=reasoning,
+        )
+
+    now = utcnow()
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = 'settled', updated_at = ?
+        WHERE session_id = ?
+        """,
+        (
+            iso(now),
+            session_id,
+        ),
+    )
+
+    append_event(
+        conn,
+        session_id=session_id,
+        draft_id=None,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=session.status,
+        new_value="settled",
+        reasoning=reasoning,
+    )
+
+    settled_session = get_session(conn, session_id)
+    assert settled_session is not None
+
+    settled_drafts = list_drafts(conn, session_id)
+
+    return settled_session, settled_drafts
+```
+
+---
+
+# 六、替换 `src/session_resolver.py`
+
+这个文件建议整体替换。
+
+核心变化是：
+
+```text
+resolve() 不再只返回 Session，
+而是返回 SessionResolutionResult。
+```
+
+新文件内容：
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .models import IncomingMessage, SessionResolutionResult
+
+
+class SessionResolver(ABC):
+    """
+    SessionResolver 接口。
+
+    职责：
+    1. 判断当前消息属于哪个会话；
+    2. 如果当前会话仍活跃，则复用；
+    3. 如果需要新开一个会话，则先结算上一个未结算会话；
+    4. 创建新的会话。
+    """
+
+    @abstractmethod
+    def conversation_key(self, message: IncomingMessage) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        raise NotImplementedError
+
+
+class DefaultSessionResolver(SessionResolver):
+    """
+    默认规则：
+
+    1. 如果有 group_id，则按群会话切分；
+    2. 如果是私聊，则按 sender_id + receiver_id 切分；
+    3. 在 SESSION_TIMEOUT_MINUTES 内有活跃 session，则复用；
+    4. 否则创建新 session；
+    5. 创建新 session 前，如果存在上一个未结算 session，则先结算它。
+    """
+
+    def conversation_key(self, message: IncomingMessage) -> str:
+        if message.group_id:
+            return f"{message.channel}:group:{message.group_id}"
+
+        if message.receiver_id:
+            a, b = sorted([message.sender_id, message.receiver_id])
+            return f"{message.channel}:private:{a}:{b}"
+
+        return f"{message.channel}:private:{message.sender_id}"
+
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        key = self.conversation_key(message)
+
+        # 1. 优先复用活跃 session
+        active_session = state_store.find_active_session(
+            conn,
+            conversation_key=key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        if active_session:
+            return SessionResolutionResult(
+                session=active_session,
+                created=False,
+                settled_session=None,
+                settled_drafts=[],
+            )
+
+        # 2. 如果没有活跃 session，准备新开一个 session。
+        # 在开新 session 之前，先查找上一个未结算 session。
+        settled_session = None
+        settled_drafts = []
+
+        previous_session = state_store.find_latest_unsettled_session(
+            conn,
+            conversation_key=key,
+        )
+
+        if previous_session:
+            settled_session, settled_drafts = state_store.settle_session(
+                conn,
+                session_id=previous_session.session_id,
+                message_id=message.message_id,
+                reasoning="settle previous session before opening new session",
+            )
+
+        # 3. 创建新 session
+        new_session = state_store.create_session(
+            conn,
+            conversation_key=key,
+            channel=message.channel,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        return SessionResolutionResult(
+            session=new_session,
+            created=True,
+            settled_session=settled_session,
+            settled_drafts=settled_drafts,
+        )
+```
+
+---
+
+# 七、修改 `src/service.py`
+
+你原来的 `service.py` 里面大部分逻辑可以不动。
+
+主要修改 `process_message()`。
+
+---
+
+## 替换 `process_message()`
+
+```python
+def process_message(
+    message: IncomingMessage,
+    resolver: SessionResolver,
+    extractor: ActionExtractor,
+) -> ProcessResult:
+    # 如果前端没有传 message_id，
+    # 我们提前生成一个，方便结算事件关联到这条触发消息。
+    if not message.message_id:
+        message = message.model_copy(
+            update={
+                "message_id": state_store.new_id("msg")
+            }
+        )
+
+    with get_db() as conn:
+        # 1. 解析 session。
+        # 如果这里触发了新 session，
+        # resolver 会先结算上一个未结算 session。
+        resolution = resolver.resolve(conn, message)
+
+        session = resolution.session
+
+        # 2. 当前消息落盘到新/当前 session 下。
+        message_id = state_store.upsert_message(
+            conn,
+            message=message,
+            session_id=session.session_id,
+        )
+
+        # 3. 读取当前 session 状态。
+        drafts = state_store.list_drafts(conn, session.session_id)
+        history = state_store.list_recent_messages(
+            conn,
+            session_id=session.session_id,
+            limit=20,
+        )
+
+        # 4. 调用 LLM / Mock extractor，生成增量 Actions。
+        llm_result = extractor.extract(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        clarify_question = llm_result.clarify_question
+
+        # 5. 逐个执行 Actions。
+        for action in llm_result.actions:
+            local_clarify = apply_action(
+                conn,
+                session_id=session.session_id,
+                drafts=drafts,
+                action=action,
+                message_id=message_id,
+            )
+
+            if local_clarify and not clarify_question:
+                clarify_question = local_clarify
+
+            # 如果发生 CREATE，后续 action 需要看到最新 drafts。
+            drafts = state_store.list_drafts(conn, session.session_id)
+
+        # 6. 如果 LLM 返回了 clarify_question，也写入事件。
+        if llm_result.clarify_question:
+            state_store.append_event(
+                conn,
+                session_id=session.session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=llm_result.clarify_question,
+                reasoning="llm clarify",
+            )
+
+        # 7. 刷新当前 session 活跃时间。
+        state_store.touch_session(conn, session.session_id)
+
+        # 8. 重新读取最新状态。
+        session = state_store.get_session(conn, session.session_id)
+        assert session is not None
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+
+        return ProcessResult(
+            session=session,
+            drafts=drafts,
+            actions=llm_result.actions,
+            clarify_question=clarify_question,
+            message_id=message_id,
+            settled_session=resolution.settled_session,
+            settled_drafts=resolution.settled_drafts,
+        )
+```
+
+---
+
+# 八、修改 `src/api.py`
+
+这里主要做三件事：
+
+1. 让 `/api/messages` 返回 `settled_session` 和 `settled_drafts`；
+2. 新增手动结算接口；
+3. 调整 `/session-resolver/resolve`。
+
+---
+
+## 1. 增加 import
+
+在 `src/api.py` 顶部导入新增模型：
+
+```python
+from .models import (
+    DraftEvent,
+    FeedbackCreate,
+    FeedbackRecord,
+    IncomingMessage,
+    ProcessResult,
+    SessionDetail,
+    SessionResolutionResult,
+    SessionSettleResult,
+    TradeDraft,
+)
+```
+
+如果你原来已经有 `SessionResolveResult`，可以先保留，但下面会用新的 `SessionResolutionResult`。
+
+---
+
+## 2. 替换 `/session-resolver/resolve`
+
+原来的接口可以改成：
+
+```python
+@router.post(
+    "/session-resolver/resolve",
+    response_model=SessionResolutionResult,
+)
+def api_resolve_session(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+):
+    """
+    SessionResolver 调试接口。
+
+    注意：
+    这个接口会真实执行 resolver 逻辑。
+    如果当前消息触发新 session，并且上一个 session 尚未结算，
+    它也会结算上一个 session。
+    """
+    with get_db() as conn:
+        return resolver.resolve(conn, payload)
+```
+
+---
+
+## 3. 新增手动结算接口
+
+```python
+@router.post(
+    "/sessions/{session_id}/settle",
+    response_model=SessionSettleResult,
+)
+def api_settle_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    手动结算一个 session。
+
+    适用场景：
+    1. 前端点击“结束会话”；
+    2. 业务系统判断本次交易沟通结束；
+    3. 后台任务发现 session 已过期；
+    4. 需要把当前 session 下所有 draft 的 slots 落定。
+
+    结算规则：
+    1. 如果所有必需字段都有值：
+       - 将所有 proposed / confirmed 状态的 slot 改成 confirmed；
+       - 其他状态不动；
+    2. 如果存在字段缺失：
+       - 将缺失字段的 slot_status 改成 unknown；
+       - 其他字段状态不动。
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            message_id=None,
+            reasoning=reason or "manual settle",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+```
+
+---
+
+## 4. 原来的 `/api/sessions/{session_id}/drafts` 可以保留
+
+你原来的：
+
+```python
+@router.get("/sessions/{session_id}/drafts", response_model=List[TradeDraft])
+def api_get_session_drafts(session_id: str):
+    ...
+```
+
+可以继续保留。
+
+它可以用于：
+
+```text
+前端主动查询某个已结算 session 的 drafts
+```
+
+但不建议让它承担结算职责。
+
+---
+
+# 九、可选：增加后台超时结算任务
+
+你现在有两种结算触发方式：
+
+## 方式 1：新消息触发
+
+如果旧 session 已经超时，但没有新消息进来，它不会立刻结算。
+
+直到下一条消息到来，`SessionResolver` 发现需要新开 session，才会结算旧 session。
+
+这符合你说的：
+
+> 新开一个 session 时，结算上一个 session。
+
+---
+
+## 方式 2：后台定时扫描
+
+如果你希望：
+
+> 一旦 session 超时，即使没有新消息，也立刻结算。
+
+那需要后台任务。
+
+可以在 `main.py` 里加一个定时循环。
+
+---
+
+## 替换 `main.py`
+
+```python
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src import state_store
+from src.api import router
+from src.db import get_db, init_db
+from src.feedback_store import init_feedback_db
+
+
+logger = logging.getLogger(__name__)
+
+
+def _settle_expired_sessions_sync() -> None:
+    """
+    同步扫描已经过期但尚未结算的 session，并结算它们。
+    """
+    now = state_store.utcnow()
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT session_id
+            FROM sessions
+            WHERE status NOT IN ('settled', 'closed')
+              AND expired_at IS NOT NULL
+              AND expired_at <= ?
+            """,
+            (now.isoformat(),),
+        ).fetchall()
+
+        for row in rows:
+            session_id = row["session_id"]
+
+            try:
+                state_store.settle_session(
+                    conn,
+                    session_id=session_id,
+                    message_id=None,
+                    reasoning="session expired",
+                )
+
+                logger.info(
+                    "Settled expired session: %s",
+                    session_id,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to settle expired session: %s",
+                    session_id,
+                )
+
+
+async def settle_expired_sessions_loop() -> None:
+    """
+    后台循环：
+    每隔一段时间检查一次过期 session。
+    """
+    while True:
+        await asyncio.sleep(30)
+
+        try:
+            await asyncio.to_thread(_settle_expired_sessions_sync)
+        except Exception:
+            logger.exception("settle_expired_sessions_loop failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化主业务库
+    init_db()
+
+    # 初始化 feedback 库
+    init_feedback_db()
+
+    # 启动后台过期结算任务
+    background_task = asyncio.create_task(
+        settle_expired_sessions_loop()
+    )
+
+    yield
+
+    # 关闭后台任务
+    background_task.cancel()
+
+    try:
+        await background_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="Trade Dialogue DST",
+    description="多轮交易对话状态追踪与增量 NER 服务",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+
+app.include_router(router, tags=["dst"])
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+```
+
+---
+
+# 十、最终接口形态
+
+完成上述修改后，你的服务有这些能力。
+
+---
+
+## 1. 持续接收消息
+
+```http
+POST /api/messages
+```
+
+如果当前 session 还没结束：
+
+```json
+{
+  "session": {
+    "session_id": "session_current"
+  },
+  "drafts": [],
+  "actions": [],
+  "message_id": "msg_xxx",
+  "settled_session": null,
+  "settled_drafts": []
+}
+```
+
+如果这条消息触发了新 session，并结算了旧 session：
+
+```json
+{
+  "session": {
+    "session_id": "session_new"
+  },
+  "drafts": [],
+  "actions": [],
+  "message_id": "msg_xxx",
+  "settled_session": {
+    "session_id": "session_old",
+    "status": "settled"
+  },
+  "settled_drafts": [
+    {
+      "draft_id": "draft_1",
+      "session_id": "session_old",
+      "asset_name": "24长发",
+      "amount": 2000,
+      "price": 100.85,
+      "slots": {
+        "asset_name": {
+          "value": "24长发",
+          "status": "confirmed"
+        },
+        "amount": {
+          "value": 2000,
+          "status": "confirmed"
+        },
+        "price": {
+          "value": 100.85,
+          "status": "confirmed"
+        },
+        "asset_code": {
+          "value": null,
+          "status": "unknown"
+        },
+        "direction": {
+          "value": null,
+          "status": "unknown"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 2. 手动结束 / 结算某个 session
+
+```http
+POST /api/sessions/{session_id}/settle?reason=user_close
+```
+
+返回：
+
+```json
+{
+  "session": {
+    "session_id": "session_old",
+    "status": "settled"
+  },
+  "drafts": [
+    {
+      "draft_id": "draft_1",
+      "slots": {
+        "asset_name": {
+          "value": "24长发",
+          "status": "confirmed"
+        },
+        "amount": {
+          "value": 2000,
+          "status": "confirmed"
+        },
+        "price": {
+          "value": 100.85,
+          "status": "confirmed"
+        },
+        "asset_code": {
+          "value": null,
+          "status": "unknown"
+        },
+        "direction": {
+          "value": null,
+          "status": "unknown"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 3. 查询某个 session 的 drafts
+
+```http
+GET /api/sessions/{session_id}/drafts
+```
+
+这个接口现在更适合做“查询”。
+
+---
+
+# 十一、你这个需求的最终执行链路
+
+现在整个系统会变成这样：
+
+```text
+消息持续进入
+    |
+    v
+FastAPI /api/messages
+    |
+    v
+SessionResolver.resolve()
+    |
+    +-- 当前 session 仍活跃
+    |       |
+    |       v
+    |   保持原有增量更新逻辑
+    |
+    +-- 当前 session 已结束 / 超时 / 需要新开
+            |
+            v
+        查找上一个未结算 session
+            |
+            v
+        settle_session(last_session_id)
+            |
+            v
+        遍历 last_session 下所有 draft
+            |
+            v
+        检查 slots / fields
+            |
+            +-- 所有字段都有值
+            |       |
+            |       v
+            |   proposed / confirmed -> confirmed
+            |
+            +-- 存在字段缺失
+                    |
+                    v
+                missing field slot_status -> unknown
+            |
+            v
+        返回 settled_session + settled_drafts
+            |
+            v
+        创建新 session
+            |
+            v
+        继续处理当前新消息
+```
+
+---
+
+# 十二、关于你说的“然后执行 api_get_session_drafts(last_session_id)”
+
+我的建议是：
+
+## 如果只是前端想拉取结果
+
+可以：
+
+```http
+GET /api/sessions/{last_session_id}/drafts
+```
+
+但前提是：
+
+```text
+last_session_id 已经被结算过
+```
+
+否则你拿到的仍然是未落定的状态。
+
+---
+
+## 更好的方式
+
+让结算接口直接返回结果：
+
+```http
+POST /api/sessions/{last_session_id}/settle
+```
+
+或者：
+
+```http
+POST /api/messages
+```
+
+返回里直接带：
+
+```json
+"settled_drafts": []
+```
+
+这样前端不需要再额外调用一次。
+
+---
+
+# 十三、你还需要特别注意一个业务问题
+
+你现在说的是：
+
+> 如果各个 field 对应的 value 都存在，那么把所有 proposed & confirmed 状态都改成 confirmed，其他状态不动。
+
+这里有一个细节：
+
+## `draft.status` 和 `slot.status` 不是一回事
+
+例如一个 draft 可能：
+
+```json
+{
+  "status": "rejected",
+  "slots": {
+    "price": {
+      "value": 100.8,
+      "status": "proposed"
+    }
+  }
+}
+```
+
+如果你按字面逻辑结算，`price` 这个 `proposed` slot 也会变成 `confirmed`。
+
+这可能不符合业务直觉。
+
+所以我在代码里留了：
+
+```python
+SETTLE_SKIP_DRAFT_STATUSES = set()
+```
+
+如果你希望：
+
+```text
+已拒绝 / 已取消的 draft 不参与结算
+```
+
+可以改成：
+
+```python
+SETTLE_SKIP_DRAFT_STATUSES = {"rejected", "cancelled"}
+```
+
+如果你坚持：
+
+```text
+所有 draft 都结算
+```
+
+就保持：
+
+```python
+SETTLE_SKIP_DRAFT_STATUSES = set()
+```
+
+---
+
+# 十四、总结
+
+你的理解可以修正成下面这句话：
+
+```text
+服务持续运行。
+每当需要新开一个 session 时，先结算上一个未结算 session。
+结算时，将旧 session 下所有 draft 的 slots 落定：
+    完整字段的 proposed / confirmed 变成 confirmed；
+    缺失字段变成 unknown；
+    其他状态保持不变。
+结算完成后，把旧 session 和旧 drafts 返回给前端。
+```
+
+代码层面核心是：
+
+```text
+state_store.settle_session()
+state_store.settle_draft()
+DefaultSessionResolver.resolve()
+POST /api/sessions/{session_id}/settle
+ProcessResult.settled_session / settled_drafts
+```
+
+这样你的服务就从：
+
+```text
+持续增量理解消息
+```
+
+升级成了：
+
+```text
+持续增量理解消息 + 会话结束自动结算
+```
+
