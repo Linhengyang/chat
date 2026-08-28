@@ -10040,3 +10040,1119 @@ ProcessResult.settled_session / settled_drafts
 持续增量理解消息 + 会话结束自动结算
 ```
 
+
+---
+🙋**user**:
+---
+```
+我觉得你说的有道理，不能完全依靠新开session才触发对上一个未结算session的结算，否则当天的最后一个session永远无法得到结算了。
+重新帮我考虑，该如何设计session的状态，以及对session的结算时机。我反正觉得当新开一个session时必然应该伴随着对上一个未结算session的结算，结算后session的状态应该编程closed或cancelled。
+也应该有轮询：以某个频率扫描是否有状态为expired的session，如果有，结算它。
+反正session的结算是纯粹的cpu work，不涉及LLM api。
+```
+
+---
+🤖**assistant**:
+---
+
+你的观察非常准确：**只靠"新开 session 触发结算"会有盲区**——当天最后一个会话永远等不到下一条消息，也就永远不会被结算。
+
+我重新设计一套**显式的 session 状态机 + 多重结算触发机制**。核心思想是：
+
+1. **结算是纯 CPU 工作**，不依赖 LLM，可以随时安全执行；
+2. **结算时机多路触发**：新消息、轮询、手动，三路兜底；
+3. **结算后进入终态**，不再参与后续状态转移。
+
+---
+
+# 一、Session 状态机设计
+
+## 1.1 状态定义
+
+我建议引入 4 个状态，其中 2 个是终态：
+
+| 状态 | 含义 | 是否终态 |
+|---|---|---|
+| `active` | 会话进行中，正在接收消息、更新草稿 | 否 |
+| `expired` | 已超时，但尚未结算（短暂中间态） | 否 |
+| `closed` | 已结算关闭（正常结束，无论字段是否齐全） | **是** |
+| `cancelled` | 已取消（用户主动取消整个会话） | **是** |
+
+## 1.2 状态转移图
+
+```
+                    ┌─────────────────┐
+        create ──►  │     active      │
+                    └────────┬────────┘
+                             │
+              timeout 检测    │    用户主动取消
+                             ▼
+                    ┌─────────────────┐         ┌──────────────┐
+                    │     expired     │         │  cancelled   │
+                    └────────┬────────┘         └──────────────┘
+                             │                        ▲
+                             │ settle                 │
+                             ▼                        │
+                    ┌─────────────────┐               │
+                    │     closed      │───────────────┘
+                    └─────────────────┘   （仅用户取消时走这条）
+```
+
+## 1.3 为什么引入 `expired` 中间态？
+
+如果没有 `expired`，直接从 `active` 跳到 `closed`，会有两个问题：
+
+1. **无法区分"刚超时"和"刚创建"**：轮询任务不知道该结算谁；
+2. **无法做"超时但未结算"的审计**：出问题时不知道哪些会话是超时导致的。
+
+引入 `expired` 后：
+
+```text
+active  ──超时检测──►  expired  ──结算──►  closed
+```
+
+每一步都有明确语义，轮询任务只需要扫 `expired`，逻辑非常干净。
+
+## 1.4 结算后状态判定
+
+你提到"结算后状态应该变成 `closed` 或 `cancelled`"。我建议这样区分：
+
+| 触发方式 | 结算后状态 |
+|---|---|
+| 新消息开新 session 触发 | `closed` |
+| 轮询超时触发 | `closed` |
+| 手动调用结算接口 | `closed` |
+| **用户主动取消**（说"不要了"、"取消"） | `cancelled` |
+
+字段是否齐全**不影响** `closed` / `cancelled`，而是用 `is_complete` 字段标记：
+
+```text
+closed + is_complete=true   → 完整成单
+closed + is_complete=false  → 不完整结束（有 unknown 字段）
+cancelled                   → 用户主动放弃
+```
+
+这样语义更清晰：**`cancelled` 表示"用户不想要了"，`closed` 表示"会话生命周期自然结束"**。
+
+---
+
+# 二、结算时机：三路触发
+
+## 2.1 触发点全景
+
+| 触发点 | 时机 | 触发方式 | close_reason |
+|---|---|---|---|
+| **T1. 新消息触发** | 新消息需要开新 session 时 | `SessionResolver.resolve()` | `new_session` |
+| **T2. 轮询触发** | 后台定时扫描 | `maintenance_loop` | `timeout_poll` |
+| **T3. 手动触发** | 前端点击"结束会话" | `POST /sessions/{id}/settle` | `manual` |
+| **T4. 用户取消** | 用户明确说"取消" | `POST /sessions/{id}/cancel` | `user_cancel` |
+
+## 2.2 为什么需要三路？
+
+```text
+T1（新消息）：解决"会话切换"场景
+T2（轮询）：  解决"当天最后一个会话"场景 ← 你提到的盲区
+T3（手动）：  解决"用户显式结束"场景
+T4（取消）：  解决"用户放弃"场景
+```
+
+四路兜底，确保**每个会话最终都会进入终态**。
+
+---
+
+# 三、数据库变更
+
+## 3.1 `sessions` 表新增字段
+
+在 `src/db.py` 的 `SCHEMA` 中，把 `sessions` 表改成：
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    close_reason TEXT,
+    is_complete INTEGER,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expired_at TEXT,
+    settled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_conversation
+ON sessions(conversation_key, status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_status
+ON sessions(status, updated_at);
+```
+
+新增字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `close_reason` | TEXT | 结算原因：`new_session` / `timeout_poll` / `manual` / `user_cancel` |
+| `is_complete` | INTEGER | 结算时字段是否齐全（0/1） |
+| `settled_at` | TEXT | 结算时间 |
+
+## 3.2 状态默认值改为 `active`
+
+原来默认是 `negotiating`，现在统一改成 `active`。
+
+---
+
+# 四、`src/models.py` 修改
+
+## 4.1 新增状态常量
+
+```python
+class SessionStatus(str, Enum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+
+
+class CloseReason(str, Enum):
+    NEW_SESSION = "new_session"
+    TIMEOUT_POLL = "timeout_poll"
+    MANUAL = "manual"
+    USER_CANCEL = "user_cancel"
+```
+
+## 4.2 更新 `Session` 模型
+
+```python
+class Session(BaseModel):
+    """
+    一次交易协商上下文。
+    """
+    session_id: str
+    conversation_key: str
+    channel: str
+    status: str = SessionStatus.ACTIVE
+    close_reason: Optional[str] = None
+    is_complete: Optional[bool] = None
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    settled_at: Optional[datetime] = None
+```
+
+---
+
+# 五、`src/state_store.py` 新增核心函数
+
+## 5.1 状态常量
+
+```python
+# Session 状态
+SESSION_ACTIVE = "active"
+SESSION_EXPIRED = "expired"
+SESSION_CLOSED = "closed"
+SESSION_CANCELLED = "cancelled"
+
+# 结算原因
+CLOSE_REASON_NEW_SESSION = "new_session"
+CLOSE_REASON_TIMEOUT_POLL = "timeout_poll"
+CLOSE_REASON_MANUAL = "manual"
+CLOSE_REASON_USER_CANCEL = "user_cancel"
+
+# 终态集合
+TERMINAL_STATUSES = {SESSION_CLOSED, SESSION_CANCELLED}
+```
+
+## 5.2 更新 `row_to_session`
+
+```python
+def row_to_session(row) -> Session:
+    return Session(
+        session_id=row["session_id"],
+        conversation_key=row["conversation_key"],
+        channel=row["channel"],
+        status=row["status"],
+        close_reason=row["close_reason"],
+        is_complete=bool(row["is_complete"]) if row["is_complete"] is not None else None,
+        started_at=parse_iso(row["started_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+        expired_at=parse_iso(row["expired_at"]),
+        settled_at=parse_iso(row["settled_at"]),
+    )
+```
+
+## 5.3 更新 `create_session`
+
+```python
+def create_session(
+    conn,
+    conversation_key: str,
+    channel: str,
+    timeout_minutes: int = 30,
+) -> Session:
+    session_id = new_id("session")
+    now = utcnow()
+    expired_at = now + timedelta(minutes=timeout_minutes)
+
+    conn.execute(
+        """
+        INSERT INTO sessions (
+            session_id,
+            conversation_key,
+            channel,
+            status,
+            started_at,
+            updated_at,
+            expired_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            conversation_key,
+            channel,
+            SESSION_ACTIVE,  # ← 改成 active
+            iso(now),
+            iso(now),
+            iso(expired_at),
+        ),
+    )
+
+    session = get_session(conn, session_id)
+    assert session is not None
+    return session
+```
+
+## 5.4 更新 `find_active_session`
+
+```python
+def find_active_session(
+    conn,
+    conversation_key: str,
+    timeout_minutes: int,
+) -> Optional[Session]:
+    """
+    查找当前会话键下仍然活跃的 session。
+    只返回 status='active' 且未超时的。
+    """
+    threshold = utcnow() - timedelta(minutes=timeout_minutes)
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        WHERE conversation_key = ?
+          AND status = ?
+          AND updated_at >= ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (conversation_key, SESSION_ACTIVE, threshold.isoformat()),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+```
+
+## 5.5 新增：标记过期 session
+
+```python
+def mark_expired_sessions(
+    conn,
+    timeout_minutes: int,
+    conversation_key: Optional[str] = None,
+) -> int:
+    """
+    将超时的 active session 标记为 expired。
+
+    参数：
+        conversation_key: 如果指定，只处理该会话；否则处理所有会话。
+
+    返回：
+        受影响的行数。
+    """
+    threshold = utcnow() - timedelta(minutes=timeout_minutes)
+    now = utcnow()
+
+    if conversation_key:
+        cursor = conn.execute(
+            """
+            UPDATE sessions
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+              AND conversation_key = ?
+              AND updated_at < ?
+            """,
+            (SESSION_EXPIRED, iso(now), SESSION_ACTIVE, conversation_key, threshold.isoformat()),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE sessions
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+              AND updated_at < ?
+            """,
+            (SESSION_EXPIRED, iso(now), SESSION_ACTIVE, threshold.isoformat()),
+        )
+
+    return cursor.rowcount
+```
+
+## 5.6 新增：查找待结算的 expired session
+
+```python
+def find_expired_sessions(
+    conn,
+    conversation_key: Optional[str] = None,
+    limit: int = 100,
+) -> List[Session]:
+    """
+    查找所有状态为 expired 的 session。
+    """
+    if conversation_key:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE status = ?
+              AND conversation_key = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (SESSION_EXPIRED, conversation_key, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE status = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (SESSION_EXPIRED, limit),
+        ).fetchall()
+
+    return [row_to_session(row) for row in rows]
+```
+
+## 5.7 更新 `settle_session`：支持终态判定
+
+```python
+def settle_session(
+    conn,
+    session_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+    close_reason: str = CLOSE_REASON_MANUAL,
+) -> tuple[Session, List[TradeDraft]]:
+    """
+    结算整个 session。
+
+    流程：
+    1. 查找该 session 下所有 draft；
+    2. 逐个 settle_draft；
+    3. 根据 close_reason 决定终态：
+       - user_cancel → cancelled
+       - 其他 → closed
+    4. 计算 is_complete（所有 draft 的所有必需字段是否齐全）；
+    5. 写入结算事件；
+    6. 返回最新的 session 和 drafts。
+    """
+    session = get_session(conn, session_id)
+
+    if session is None:
+        raise ValueError(f"session not found: {session_id}")
+
+    # 幂等：已经是终态，直接返回
+    if session.status in TERMINAL_STATUSES:
+        return session, list_drafts(conn, session_id)
+
+    drafts = list_drafts(conn, session_id)
+
+    # 结算每个 draft，并统计是否完整
+    all_complete = True
+
+    for draft in drafts:
+        if draft.status in SETTLE_SKIP_DRAFT_STATUSES:
+            continue
+
+        settled_draft = settle_draft(
+            conn,
+            draft_id=draft.draft_id,
+            message_id=message_id,
+            reasoning=reasoning,
+        )
+
+        # 检查是否有 unknown 字段
+        if settled_draft:
+            has_unknown = any(
+                slot.status == "unknown"
+                for slot in settled_draft.slots.values()
+            )
+            if has_unknown:
+                all_complete = False
+
+    # 决定终态
+    if close_reason == CLOSE_REASON_USER_CANCEL:
+        final_status = SESSION_CANCELLED
+    else:
+        final_status = SESSION_CLOSED
+
+    now = utcnow()
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = ?,
+            close_reason = ?,
+            is_complete = ?,
+            settled_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (
+            final_status,
+            close_reason,
+            1 if all_complete else 0,
+            iso(now),
+            iso(now),
+            session_id,
+        ),
+    )
+
+    append_event(
+        conn,
+        session_id=session_id,
+        draft_id=None,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=session.status,
+        new_value={
+            "status": final_status,
+            "close_reason": close_reason,
+            "is_complete": all_complete,
+        },
+        reasoning=reasoning,
+    )
+
+    settled_session = get_session(conn, session_id)
+    assert settled_session is not None
+
+    settled_drafts = list_drafts(conn, session_id)
+
+    return settled_session, settled_drafts
+```
+
+## 5.8 新增：批量结算所有 expired session
+
+```python
+def settle_all_expired_sessions(
+    conn,
+    close_reason: str = CLOSE_REASON_TIMEOUT_POLL,
+    reasoning: Optional[str] = None,
+) -> List[tuple[Session, List[TradeDraft]]]:
+    """
+    批量结算所有状态为 expired 的 session。
+
+    用于轮询任务。
+    """
+    expired_sessions = find_expired_sessions(conn)
+    results = []
+
+    for session in expired_sessions:
+        try:
+            settled_session, settled_drafts = settle_session(
+                conn,
+                session_id=session.session_id,
+                close_reason=close_reason,
+                reasoning=reasoning or "session expired",
+            )
+            results.append((settled_session, settled_drafts))
+        except Exception:
+            # 单个 session 结算失败不影响其他
+            continue
+
+    return results
+```
+
+## 5.9 新增：按会话键结算
+
+```python
+def settle_expired_sessions_for_conversation(
+    conn,
+    conversation_key: str,
+    close_reason: str = CLOSE_REASON_NEW_SESSION,
+    reasoning: Optional[str] = None,
+) -> List[tuple[Session, List[TradeDraft]]]:
+    """
+    结算某个会话键下所有状态为 expired 的 session。
+
+    用于 SessionResolver 开新 session 前。
+    """
+    expired_sessions = find_expired_sessions(
+        conn,
+        conversation_key=conversation_key,
+    )
+    results = []
+
+    for session in expired_sessions:
+        settled_session, settled_drafts = settle_session(
+            conn,
+            session_id=session.session_id,
+            close_reason=close_reason,
+            reasoning=reasoning or "settle before opening new session",
+        )
+        results.append((settled_session, settled_drafts))
+
+    return results
+```
+
+## 5.10 移除或替换 `find_latest_unsettled_session`
+
+原来的 `find_latest_unsettled_session` 可以删掉，因为现在逻辑变成：
+
+```text
+1. 先 mark_expired_sessions（把超时的 active 标成 expired）
+2. 再 settle_expired_sessions_for_conversation（结算所有 expired）
+```
+
+不再需要"查找未结算"这个模糊概念。
+
+---
+
+# 六、`src/session_resolver.py` 修改
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .models import IncomingMessage, SessionResolutionResult
+
+
+class SessionResolver(ABC):
+    """
+    SessionResolver 接口。
+
+    职责：
+    1. 判断当前消息属于哪个会话；
+    2. 如果当前会话仍活跃，则复用；
+    3. 如果需要新开一个会话：
+       a. 先把超时的 active 标记为 expired；
+       b. 结算所有 expired 的 session；
+       c. 创建新 session。
+    """
+
+    @abstractmethod
+    def conversation_key(self, message: IncomingMessage) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        raise NotImplementedError
+
+
+class DefaultSessionResolver(SessionResolver):
+    """
+    默认规则：
+
+    1. 如果有 group_id，则按群会话切分；
+    2. 如果是私聊，则按 sender_id + receiver_id 切分；
+    3. 在 SESSION_TIMEOUT_MINUTES 内有活跃 session，则复用；
+    4. 否则：
+       a. 把超时的 active 标记为 expired；
+       b. 结算所有 expired 的 session；
+       c. 创建新 session。
+    """
+
+    def conversation_key(self, message: IncomingMessage) -> str:
+        if message.group_id:
+            return f"{message.channel}:group:{message.group_id}"
+
+        if message.receiver_id:
+            a, b = sorted([message.sender_id, message.receiver_id])
+            return f"{message.channel}:private:{a}:{b}"
+
+        return f"{message.channel}:private:{message.sender_id}"
+
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        key = self.conversation_key(message)
+
+        # ────────────────────────────────────────────
+        # Step 1: 把当前会话下超时的 active 标记为 expired
+        # ────────────────────────────────────────────
+        state_store.mark_expired_sessions(
+            conn,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            conversation_key=key,
+        )
+
+        # ────────────────────────────────────────────
+        # Step 2: 查找仍然活跃的 session
+        # ────────────────────────────────────────────
+        active_session = state_store.find_active_session(
+            conn,
+            conversation_key=key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        if active_session:
+            return SessionResolutionResult(
+                session=active_session,
+                created=False,
+                settled_session=None,
+                settled_drafts=[],
+            )
+
+        # ────────────────────────────────────────────
+        # Step 3: 结算所有 expired 的 session
+        # ────────────────────────────────────────────
+        settled_results = state_store.settle_expired_sessions_for_conversation(
+            conn,
+            conversation_key=key,
+            close_reason=state_store.CLOSE_REASON_NEW_SESSION,
+            reasoning="settle before opening new session",
+        )
+
+        # 取最近一个结算结果返回给前端
+        settled_session = None
+        settled_drafts = []
+
+        if settled_results:
+            settled_session, settled_drafts = settled_results[0]
+
+        # ────────────────────────────────────────────
+        # Step 4: 创建新 session
+        # ────────────────────────────────────────────
+        new_session = state_store.create_session(
+            conn,
+            conversation_key=key,
+            channel=message.channel,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        return SessionResolutionResult(
+            session=new_session,
+            created=True,
+            settled_session=settled_session,
+            settled_drafts=settled_drafts,
+        )
+```
+
+---
+
+# 七、后台轮询任务
+
+## 7.1 新增 `src/maintenance.py`
+
+```python
+"""
+后台维护任务：
+1. 标记过期 session
+2. 结算 expired session
+
+这是纯 CPU 工作，不涉及 LLM API。
+"""
+
+import logging
+from typing import Optional
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .db import get_db
+
+
+logger = logging.getLogger(__name__)
+
+
+def run_maintenance_sync(
+    conversation_key: Optional[str] = None,
+) -> dict:
+    """
+    执行一次维护任务（同步版本）。
+
+    流程：
+    1. 把超时的 active session 标记为 expired；
+    2. 结算所有 expired 的 session。
+
+    返回：
+        {
+            "marked_expired": int,
+            "settled": int,
+        }
+    """
+    with get_db() as conn:
+        # Step 1: 标记过期
+        marked = state_store.mark_expired_sessions(
+            conn,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            conversation_key=conversation_key,
+        )
+
+        # Step 2: 结算
+        results = state_store.settle_all_expired_sessions(
+            conn,
+            close_reason=state_store.CLOSE_REASON_TIMEOUT_POLL,
+            reasoning="session expired (poll)",
+        )
+
+        settled = len(results)
+
+        if marked > 0 or settled > 0:
+            logger.info(
+                "Maintenance: marked %d expired, settled %d sessions",
+                marked,
+                settled,
+            )
+
+        return {
+            "marked_expired": marked,
+            "settled": settled,
+        }
+
+
+async def run_maintenance_async(
+    conversation_key: Optional[str] = None,
+) -> dict:
+    """
+    执行一次维护任务（异步版本）。
+    """
+    import asyncio
+    return await asyncio.to_thread(
+        run_maintenance_sync,
+        conversation_key,
+    )
+```
+
+## 7.2 更新 `main.py`：加入轮询循环
+
+```python
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src.api import router
+from src.db import init_db
+from src.feedback_store import init_feedback_db
+from src.maintenance import run_maintenance_sync
+
+
+logger = logging.getLogger(__name__)
+
+# 轮询间隔（秒）
+MAINTENANCE_INTERVAL_SECONDS = 30
+
+
+async def maintenance_loop() -> None:
+    """
+    后台轮询任务：
+    每隔 MAINTENANCE_INTERVAL_SECONDS 秒执行一次维护。
+    """
+    while True:
+        try:
+            result = await asyncio.to_thread(run_maintenance_sync)
+
+            if result["marked_expired"] > 0 or result["settled"] > 0:
+                logger.info(
+                    "Maintenance loop: marked=%d, settled=%d",
+                    result["marked_expired"],
+                    result["settled"],
+                )
+
+        except Exception:
+            logger.exception("Maintenance loop failed")
+
+        await asyncio.sleep(MAINTENANCE_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化数据库
+    init_db()
+    init_feedback_db()
+
+    # 启动后台维护任务
+    maintenance_task = asyncio.create_task(maintenance_loop())
+
+    logger.info(
+        "Maintenance loop started (interval=%ds)",
+        MAINTENANCE_INTERVAL_SECONDS,
+    )
+
+    yield
+
+    # 关闭后台任务
+    maintenance_task.cancel()
+    try:
+        await maintenance_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="Trade Dialogue DST",
+    description="多轮交易对话状态追踪与增量 NER 服务",
+    version="0.4.0",
+    lifespan=lifespan,
+)
+
+app.include_router(router, tags=["dst"])
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+---
+
+# 八、API 新增接口
+
+## 8.1 手动结算（已有，更新 `close_reason`）
+
+```python
+@router.post(
+    "/sessions/{session_id}/settle",
+    response_model=SessionSettleResult,
+)
+def api_settle_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    手动结算一个 session。
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_MANUAL,
+            reasoning=reason or "manual settle",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+```
+
+## 8.2 新增：用户取消
+
+```python
+@router.post(
+    "/sessions/{session_id}/cancel",
+    response_model=SessionSettleResult,
+)
+def api_cancel_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    用户主动取消一个 session。
+
+    与 /settle 的区别：
+    - /settle 结算后状态为 closed
+    - /cancel 结算后状态为 cancelled
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_USER_CANCEL,
+            reasoning=reason or "user cancel",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+```
+
+## 8.3 新增：手动触发维护（调试用）
+
+```python
+@router.post("/maintenance/run")
+def api_run_maintenance():
+    """
+    手动触发一次维护任务（调试用）。
+
+    生产环境由后台轮询自动执行。
+    """
+    from .maintenance import run_maintenance_sync
+
+    result = run_maintenance_sync()
+
+    return {
+        "status": "ok",
+        "marked_expired": result["marked_expired"],
+        "settled": result["settled"],
+    }
+```
+
+---
+
+# 九、完整状态转移表
+
+| 当前状态 | 触发事件 | 目标状态 | 触发函数 |
+|---|---|---|---|
+| - | 创建 | `active` | `create_session()` |
+| `active` | 超时 | `expired` | `mark_expired_sessions()` |
+| `expired` | 结算 | `closed` | `settle_session(close_reason=...)` |
+| `expired` | 用户取消 | `cancelled` | `settle_session(close_reason=user_cancel)` |
+| `active` | 用户取消 | `cancelled` | `settle_session(close_reason=user_cancel)` |
+| `closed` | 任何 | `closed`（终态） | - |
+| `cancelled` | 任何 | `cancelled`（终态） | - |
+
+---
+
+# 十、结算时机总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    结算触发全景                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  T1. 新消息触发（SessionResolver）                          │
+│      ├─ 条件：新消息需要开新 session                        │
+│      ├─ 动作：先结算当前会话下所有 expired                  │
+│      └─ close_reason: new_session                           │
+│                                                             │
+│  T2. 轮询触发（maintenance_loop）                           │
+│      ├─ 条件：每 30 秒扫描一次                              │
+│      ├─ 动作：标记过期 → 结算所有 expired                   │
+│      └─ close_reason: timeout_poll                          │
+│                                                             │
+│  T3. 手动触发（/settle）                                    │
+│      ├─ 条件：前端点击"结束会话"                            │
+│      ├─ 动作：结算指定 session                              │
+│      └─ close_reason: manual                                │
+│                                                             │
+│  T4. 用户取消（/cancel）                                    │
+│      ├─ 条件：用户明确说"不要了"                            │
+│      ├─ 动作：结算指定 session，状态为 cancelled            │
+│      └─ close_reason: user_cancel                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 十一、回答你的核心问题
+
+> 我反正觉得当新开一个session时必然应该伴随着对上一个未结算session的结算，结算后session的状态应该变成closed或cancelled。
+
+✅ **完全正确**。代码中 `SessionResolver.resolve()` 现在会：
+
+1. 先 `mark_expired_sessions()` 把超时的 `active` 标成 `expired`；
+2. 再 `settle_expired_sessions_for_conversation()` 结算所有 `expired`；
+3. 最后 `create_session()` 开新的。
+
+结算后状态：
+
+- 正常结算 → `closed`
+- 用户取消 → `cancelled`
+
+> 也应该有轮询：以某个频率扫描是否有状态为expired的session，如果有，结算它。
+
+✅ **完全正确**。`maintenance_loop` 每 30 秒：
+
+1. `mark_expired_sessions()`：把超时的 `active` 标成 `expired`；
+2. `settle_all_expired_sessions()`：结算所有 `expired`。
+
+这样**当天最后一个 session 也会在一定时间后被轮询任务结算**，不会永远悬着。
+
+> 反正session的结算是纯粹的cpu work，不涉及LLM api。
+
+✅ **完全正确**。整个结算链路：
+
+```text
+mark_expired_sessions()     → 纯 SQL UPDATE
+settle_draft()              → 纯 Python 字段检查 + SQL UPDATE
+settle_session()            → 纯 Python 循环 + SQL UPDATE
+```
+
+**没有任何 LLM 调用**，速度快、成本低、可以随时安全执行。
+
+---
+
+# 十二、最终架构图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        FastAPI 服务                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │ /api/messages│    │ /settle      │    │ /cancel      │  │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
+│         │                   │                   │          │
+│         ▼                   ▼                   ▼          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              SessionResolver.resolve()               │   │
+│  │  1. mark_expired_sessions()                         │   │
+│  │  2. find_active_session()                           │   │
+│  │  3. settle_expired_sessions_for_conversation()      │   │
+│  │  4. create_session()                                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │           maintenance_loop (后台轮询)                │   │
+│  │  每 30 秒：                                          │   │
+│  │  1. mark_expired_sessions()                         │   │
+│  │  2. settle_all_expired_sessions()                   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              state_store (纯 CPU)                    │   │
+│  │  - settle_draft()                                   │   │
+│  │  - settle_session()                                 │   │
+│  │  - mark_expired_sessions()                          │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                  SQLite (data/)                      │   │
+│  │  - app.db: sessions / messages / drafts / events    │   │
+│  │  - feedback.db: feedback                            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+这套设计确保了：
+
+1. **每个 session 最终都会进入终态**（四路触发兜底）；
+2. **结算是纯 CPU 工作**，可以随时安全执行；
+3. **状态机清晰**，`active → expired → closed/cancelled`；
+4. **审计完整**，`close_reason` + `is_complete` + `settled_at` 记录一切。
+
