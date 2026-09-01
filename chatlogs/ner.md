@@ -11156,3 +11156,1323 @@ settle_session()            → 纯 Python 循环 + SQL UPDATE
 3. **状态机清晰**，`active → expired → closed/cancelled`；
 4. **审计完整**，`close_reason` + `is_complete` + `settled_at` 记录一切。
 
+
+---
+🙋**user**:
+---
+```
+is_complete字段放在session去判断？我怎么觉得有点不对呢？单个session内部，可以有所有slots都confirmed的tradedraft，也可以有部分slots未能confirmed的tradedraft才对吧？
+这个is_complete判断应该放在tradedraft内部才对啊。
+请将结算会话 settle session 部分的改动重新描述，基于你前面给出的第一版代码。
+```
+
+---
+🤖**assistant**:
+---
+
+你说得对。`is_complete` 放在 session 级别确实不合理。
+
+一个 session 内部可能同时存在：
+
+```text
+draft_1: 所有字段齐全 → is_complete = true
+draft_2: 缺少 asset_code → is_complete = false
+draft_3: 缺少 price → is_complete = false
+```
+
+所以 `is_complete` 应该放在 **每个 `trade_draft` 内部**，而不是 session 上。
+
+下面我基于第一版代码，重新描述结算部分的完整改动。
+
+---
+
+# 一、改动文件清单
+
+| 文件 | 改动内容 |
+|---|---|
+| `src/models.py` | 新增状态枚举，修改 `Session`、`TradeDraft` 模型 |
+| `src/db.py` | 修改 `sessions` 和 `trade_drafts` 表结构 |
+| `src/state_store.py` | 新增结算核心函数 |
+| `src/session_resolver.py` | 修改 `resolve()` 逻辑 |
+| `src/api.py` | 新增 `/settle`、`/cancel` 接口 |
+| `src/maintenance.py` | **新增文件**，后台轮询 |
+| `main.py` | 启动后台轮询任务 |
+
+---
+
+# 二、`src/models.py` 修改
+
+## 2.1 新增状态枚举
+
+在文件顶部 `from enum import Enum` 之后，新增：
+
+```python
+class SessionStatus(str, Enum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+
+
+class CloseReason(str, Enum):
+    NEW_SESSION = "new_session"
+    TIMEOUT_POLL = "timeout_poll"
+    MANUAL = "manual"
+    USER_CANCEL = "user_cancel"
+```
+
+## 2.2 修改 `Session` 模型
+
+替换原来的 `Session`：
+
+```python
+class Session(BaseModel):
+    """
+    一次交易协商上下文。
+
+    状态机：
+        active → expired → closed
+        active → cancelled
+        expired → cancelled
+    """
+    session_id: str
+    conversation_key: str
+    channel: str
+    status: str = "active"
+    close_reason: Optional[str] = None
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    settled_at: Optional[datetime] = None
+```
+
+注意：**`Session` 上没有 `is_complete`**。
+
+## 2.3 修改 `TradeDraft` 模型
+
+替换原来的 `TradeDraft`，新增 `is_complete` 字段：
+
+```python
+class TradeDraft(BaseModel):
+    """
+    一笔交易草稿。
+
+    结算后：
+    - is_complete=true  → 所有必需字段都有值
+    - is_complete=false → 存在字段缺失
+    """
+    draft_id: str
+    session_id: str
+    asset_name: Optional[str] = None
+    asset_code: Optional[str] = None
+    direction: Optional[str] = None
+    amount: Optional[float] = None
+    price: Optional[float] = None
+    status: str = "negotiating"  # negotiating / confirmed / rejected / cancelled
+    slots: Dict[str, SlotState] = Field(default_factory=dict)
+    is_complete: Optional[bool] = None  # ← 新增：结算时判断
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+```
+
+## 2.4 修改 `ProcessResult`
+
+新增 `settled_session` 和 `settled_drafts`：
+
+```python
+class ProcessResult(BaseModel):
+    """
+    单次消息处理结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+
+    # 如果本次消息触发了新 session，并结算了上一个 session，
+    # 这里会返回被结算的旧 session 以及旧 session 下的所有草稿。
+    settled_session: Optional[Session] = None
+    settled_drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+## 2.5 新增 `SessionSettleResult`
+
+```python
+class SessionSettleResult(BaseModel):
+    """
+    Session 结算结果。
+    """
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+## 2.6 新增 `SessionResolutionResult`
+
+```python
+class SessionResolutionResult(BaseModel):
+    """
+    SessionResolver 的解析结果。
+
+    如果当前消息仍然属于活跃 session，则只返回当前 session。
+    如果当前消息触发了新 session，并且系统自动结算了上一个 session，
+    则同时返回 settled_session 和 settled_drafts。
+    """
+    session: Session
+    created: bool = False
+
+    settled_session: Optional[Session] = None
+    settled_drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+---
+
+# 三、`src/db.py` 修改
+
+## 3.1 修改 `sessions` 表
+
+替换 `SCHEMA` 中的 `sessions` 表：
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    close_reason TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expired_at TEXT,
+    settled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_conversation
+ON sessions(conversation_key, status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_status
+ON sessions(status, updated_at);
+```
+
+## 3.2 修改 `trade_drafts` 表
+
+替换 `SCHEMA` 中的 `trade_drafts` 表，新增 `is_complete` 字段：
+
+```sql
+CREATE TABLE IF NOT EXISTS trade_drafts (
+    draft_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    asset_name TEXT,
+    asset_code TEXT,
+    direction TEXT,
+    amount REAL,
+    price REAL,
+    status TEXT NOT NULL DEFAULT 'negotiating',
+    slots_json TEXT NOT NULL DEFAULT '{}',
+    is_complete INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_drafts_session
+ON trade_drafts(session_id);
+```
+
+---
+
+# 四、`src/state_store.py` 修改
+
+这是改动最大的文件。以下所有函数都是**新增**或**替换**的。
+
+## 4.1 新增常量
+
+在文件顶部新增：
+
+```python
+# Session 状态
+SESSION_ACTIVE = "active"
+SESSION_EXPIRED = "expired"
+SESSION_CLOSED = "closed"
+SESSION_CANCELLED = "cancelled"
+
+# 结算原因
+CLOSE_REASON_NEW_SESSION = "new_session"
+CLOSE_REASON_TIMEOUT_POLL = "timeout_poll"
+CLOSE_REASON_MANUAL = "manual"
+CLOSE_REASON_USER_CANCEL = "user_cancel"
+
+# 终态集合
+TERMINAL_STATUSES = {SESSION_CLOSED, SESSION_CANCELLED}
+
+# 结算时需要检查的必需字段
+# 你可以根据业务调整
+REQUIRED_SETTLE_FIELDS = (
+    "asset_name",
+    "asset_code",
+    "direction",
+    "amount",
+    "price",
+)
+
+# 如果你不想结算已被拒绝 / 取消的 draft，可以改成：
+# SETTLE_SKIP_DRAFT_STATUSES = {"rejected", "cancelled"}
+SETTLE_SKIP_DRAFT_STATUSES = set()
+```
+
+## 4.2 修改 `row_to_session`
+
+```python
+def row_to_session(row) -> Session:
+    return Session(
+        session_id=row["session_id"],
+        conversation_key=row["conversation_key"],
+        channel=row["channel"],
+        status=row["status"],
+        close_reason=row["close_reason"],
+        started_at=parse_iso(row["started_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+        expired_at=parse_iso(row["expired_at"]),
+        settled_at=parse_iso(row["settled_at"]),
+    )
+```
+
+## 4.3 修改 `row_to_draft`
+
+```python
+def row_to_draft(row) -> TradeDraft:
+    slots_raw = json.loads(row["slots_json"] or "{}")
+    slots = {
+        key: SlotState(**value)
+        for key, value in slots_raw.items()
+    }
+
+    return TradeDraft(
+        draft_id=row["draft_id"],
+        session_id=row["session_id"],
+        asset_name=row["asset_name"],
+        asset_code=row["asset_code"],
+        direction=row["direction"],
+        amount=row["amount"],
+        price=row["price"],
+        status=row["status"],
+        slots=slots,
+        is_complete=bool(row["is_complete"]) if row["is_complete"] is not None else None,
+        created_at=parse_iso(row["created_at"]),
+        updated_at=parse_iso(row["updated_at"]),
+    )
+```
+
+## 4.4 修改 `create_session`
+
+```python
+def create_session(
+    conn,
+    conversation_key: str,
+    channel: str,
+    timeout_minutes: int = 30,
+) -> Session:
+    session_id = new_id("session")
+    now = utcnow()
+    expired_at = now + timedelta(minutes=timeout_minutes)
+
+    conn.execute(
+        """
+        INSERT INTO sessions (
+            session_id,
+            conversation_key,
+            channel,
+            status,
+            started_at,
+            updated_at,
+            expired_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            conversation_key,
+            channel,
+            SESSION_ACTIVE,
+            iso(now),
+            iso(now),
+            iso(expired_at),
+        ),
+    )
+
+    session = get_session(conn, session_id)
+    assert session is not None
+    return session
+```
+
+## 4.5 修改 `find_active_session`
+
+```python
+def find_active_session(
+    conn,
+    conversation_key: str,
+    timeout_minutes: int,
+) -> Optional[Session]:
+    """
+    查找当前会话键下仍然活跃的 session。
+    只返回 status='active' 且未超时的。
+    """
+    threshold = utcnow() - timedelta(minutes=timeout_minutes)
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        WHERE conversation_key = ?
+          AND status = ?
+          AND updated_at >= ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (conversation_key, SESSION_ACTIVE, threshold.isoformat()),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+```
+
+## 4.6 新增：`mark_expired_sessions`
+
+```python
+def mark_expired_sessions(
+    conn,
+    timeout_minutes: int,
+    conversation_key: Optional[str] = None,
+) -> int:
+    """
+    将超时的 active session 标记为 expired。
+
+    参数：
+        conversation_key: 如果指定，只处理该会话；否则处理所有会话。
+
+    返回：
+        受影响的行数。
+    """
+    threshold = utcnow() - timedelta(minutes=timeout_minutes)
+    now = utcnow()
+
+    if conversation_key:
+        cursor = conn.execute(
+            """
+            UPDATE sessions
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+              AND conversation_key = ?
+              AND updated_at < ?
+            """,
+            (
+                SESSION_EXPIRED,
+                iso(now),
+                SESSION_ACTIVE,
+                conversation_key,
+                threshold.isoformat(),
+            ),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE sessions
+            SET status = ?, updated_at = ?
+            WHERE status = ?
+              AND updated_at < ?
+            """,
+            (
+                SESSION_EXPIRED,
+                iso(now),
+                SESSION_ACTIVE,
+                threshold.isoformat(),
+            ),
+        )
+
+    return cursor.rowcount
+```
+
+## 4.7 新增：`find_expired_sessions`
+
+```python
+def find_expired_sessions(
+    conn,
+    conversation_key: Optional[str] = None,
+    limit: int = 100,
+) -> List[Session]:
+    """
+    查找所有状态为 expired 的 session。
+    """
+    if conversation_key:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE status = ?
+              AND conversation_key = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (SESSION_EXPIRED, conversation_key, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE status = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (SESSION_EXPIRED, limit),
+        ).fetchall()
+
+    return [row_to_session(row) for row in rows]
+```
+
+## 4.8 新增：`_is_missing_value`
+
+```python
+def _is_missing_value(value: Any) -> bool:
+    """
+    判断某个字段值是否缺失。
+
+    规则：
+    1. None 算缺失；
+    2. 空字符串算缺失；
+    3. 0 不算缺失；
+    4. False 不算缺失。
+    """
+    if value is None:
+        return True
+
+    if isinstance(value, str) and not value.strip():
+        return True
+
+    return False
+```
+
+## 4.9 新增：`settle_draft`（核心）
+
+```python
+def settle_draft(
+    conn,
+    draft_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+) -> Optional[TradeDraft]:
+    """
+    结算单个 trade_draft。
+
+    规则：
+    1. 检查 REQUIRED_SETTLE_FIELDS 是否都有值；
+    2. 如果所有字段都有值：
+       - is_complete = true
+       - 将所有 proposed / confirmed 状态的 slot 改成 confirmed；
+       - 其他状态不动；
+    3. 如果存在字段缺失：
+       - is_complete = false
+       - 将缺失字段的 slot_status 改成 unknown；
+       - 其他已有字段状态不动。
+    """
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    slots = json.loads(row["slots_json"] or "{}")
+    now = utcnow()
+
+    # ────────────────────────────────────────────
+    # Step 1: 检查哪些字段缺失
+    # ────────────────────────────────────────────
+    missing_fields = []
+
+    for field in REQUIRED_SETTLE_FIELDS:
+        value = row[field]
+        if _is_missing_value(value):
+            missing_fields.append(field)
+
+    # ────────────────────────────────────────────
+    # Step 2: 根据是否缺失，决定 is_complete
+    # ────────────────────────────────────────────
+    is_complete = len(missing_fields) == 0
+
+    if missing_fields:
+        # 存在字段缺失：
+        # 只把缺失字段的 slot 标成 unknown。
+        for field in missing_fields:
+            slots[field] = SlotState(
+                value=None,
+                status="unknown",
+                source_message_id=message_id,
+                updated_at=now,
+            ).model_dump(mode="json")
+
+    else:
+        # 所有字段都有值：
+        # 先确保每个必需字段都有 slot。
+        for field in REQUIRED_SETTLE_FIELDS:
+            if field not in slots:
+                slots[field] = SlotState(
+                    value=row[field],
+                    status="confirmed",
+                    source_message_id=message_id,
+                    updated_at=now,
+                ).model_dump(mode="json")
+
+        # 将所有 proposed / confirmed 的 slot 改成 confirmed。
+        # 其他状态，例如 rejected / ambiguous / unknown，不动。
+        for slot in slots.values():
+            if slot.get("status") in {"proposed", "confirmed"}:
+                slot["status"] = "confirmed"
+                slot["updated_at"] = now.isoformat()
+
+    # ────────────────────────────────────────────
+    # Step 3: 写回数据库
+    # ────────────────────────────────────────────
+    conn.execute(
+        """
+        UPDATE trade_drafts
+        SET slots_json = ?,
+            is_complete = ?,
+            updated_at = ?
+        WHERE draft_id = ?
+        """,
+        (
+            json.dumps(slots, ensure_ascii=False),
+            1 if is_complete else 0,
+            iso(now),
+            draft_id,
+        ),
+    )
+
+    # ────────────────────────────────────────────
+    # Step 4: 写入结算事件
+    # ────────────────────────────────────────────
+    append_event(
+        conn,
+        session_id=row["session_id"],
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=None,
+        new_value={
+            "is_complete": is_complete,
+            "missing_fields": missing_fields,
+        },
+        reasoning=reasoning,
+    )
+
+    return get_draft(conn, draft_id)
+```
+
+## 4.10 新增：`settle_session`（核心）
+
+```python
+def settle_session(
+    conn,
+    session_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+    close_reason: str = CLOSE_REASON_MANUAL,
+) -> tuple[Session, List[TradeDraft]]:
+    """
+    结算整个 session。
+
+    流程：
+    1. 查找该 session 下所有 draft；
+    2. 逐个 settle_draft（每个 draft 独立判断 is_complete）；
+    3. 根据 close_reason 决定终态：
+       - user_cancel → cancelled
+       - 其他 → closed
+    4. 写入结算事件；
+    5. 返回最新的 session 和 drafts。
+
+    注意：
+    - is_complete 在每个 draft 上独立判断，不在 session 上；
+    - session 只记录 close_reason 和 settled_at。
+    """
+    session = get_session(conn, session_id)
+
+    if session is None:
+        raise ValueError(f"session not found: {session_id}")
+
+    # 幂等：已经是终态，直接返回
+    if session.status in TERMINAL_STATUSES:
+        return session, list_drafts(conn, session_id)
+
+    drafts = list_drafts(conn, session_id)
+
+    # ────────────────────────────────────────────
+    # Step 1: 逐个结算每个 draft
+    # ────────────────────────────────────────────
+    for draft in drafts:
+        if draft.status in SETTLE_SKIP_DRAFT_STATUSES:
+            continue
+
+        settle_draft(
+            conn,
+            draft_id=draft.draft_id,
+            message_id=message_id,
+            reasoning=reasoning,
+        )
+
+    # ────────────────────────────────────────────
+    # Step 2: 决定终态
+    # ────────────────────────────────────────────
+    if close_reason == CLOSE_REASON_USER_CANCEL:
+        final_status = SESSION_CANCELLED
+    else:
+        final_status = SESSION_CLOSED
+
+    now = utcnow()
+
+    # ────────────────────────────────────────────
+    # Step 3: 更新 session 状态
+    # ────────────────────────────────────────────
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = ?,
+            close_reason = ?,
+            settled_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (
+            final_status,
+            close_reason,
+            iso(now),
+            iso(now),
+            session_id,
+        ),
+    )
+
+    # ────────────────────────────────────────────
+    # Step 4: 写入结算事件
+    # ────────────────────────────────────────────
+    append_event(
+        conn,
+        session_id=session_id,
+        draft_id=None,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=session.status,
+        new_value={
+            "status": final_status,
+            "close_reason": close_reason,
+        },
+        reasoning=reasoning,
+    )
+
+    # ────────────────────────────────────────────
+    # Step 5: 返回最新状态
+    # ────────────────────────────────────────────
+    settled_session = get_session(conn, session_id)
+    assert settled_session is not None
+
+    settled_drafts = list_drafts(conn, session_id)
+
+    return settled_session, settled_drafts
+```
+
+## 4.11 新增：`settle_all_expired_sessions`
+
+```python
+def settle_all_expired_sessions(
+    conn,
+    close_reason: str = CLOSE_REASON_TIMEOUT_POLL,
+    reasoning: Optional[str] = None,
+) -> List[tuple[Session, List[TradeDraft]]]:
+    """
+    批量结算所有状态为 expired 的 session。
+
+    用于轮询任务。
+    """
+    expired_sessions = find_expired_sessions(conn)
+    results = []
+
+    for session in expired_sessions:
+        try:
+            settled_session, settled_drafts = settle_session(
+                conn,
+                session_id=session.session_id,
+                close_reason=close_reason,
+                reasoning=reasoning or "session expired (poll)",
+            )
+            results.append((settled_session, settled_drafts))
+        except Exception:
+            # 单个 session 结算失败不影响其他
+            continue
+
+    return results
+```
+
+## 4.12 新增：`settle_expired_sessions_for_conversation`
+
+```python
+def settle_expired_sessions_for_conversation(
+    conn,
+    conversation_key: str,
+    close_reason: str = CLOSE_REASON_NEW_SESSION,
+    reasoning: Optional[str] = None,
+) -> List[tuple[Session, List[TradeDraft]]]:
+    """
+    结算某个会话键下所有状态为 expired 的 session。
+
+    用于 SessionResolver 开新 session 前。
+    """
+    expired_sessions = find_expired_sessions(
+        conn,
+        conversation_key=conversation_key,
+    )
+    results = []
+
+    for session in expired_sessions:
+        settled_session, settled_drafts = settle_session(
+            conn,
+            session_id=session.session_id,
+            close_reason=close_reason,
+            reasoning=reasoning or "settle before opening new session",
+        )
+        results.append((settled_session, settled_drafts))
+
+    return results
+```
+
+---
+
+# 五、`src/session_resolver.py` 修改
+
+整体替换：
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .models import IncomingMessage, SessionResolutionResult
+
+
+class SessionResolver(ABC):
+    """
+    SessionResolver 接口。
+
+    职责：
+    1. 判断当前消息属于哪个会话；
+    2. 如果当前会话仍活跃，则复用；
+    3. 如果需要新开一个会话：
+       a. 先把超时的 active 标记为 expired；
+       b. 结算所有 expired 的 session；
+       c. 创建新 session。
+    """
+
+    @abstractmethod
+    def conversation_key(self, message: IncomingMessage) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        raise NotImplementedError
+
+
+class DefaultSessionResolver(SessionResolver):
+    """
+    默认规则：
+
+    1. 如果有 group_id，则按群会话切分；
+    2. 如果是私聊，则按 sender_id + receiver_id 切分；
+    3. 在 SESSION_TIMEOUT_MINUTES 内有活跃 session，则复用；
+    4. 否则：
+       a. 把超时的 active 标记为 expired；
+       b. 结算所有 expired 的 session；
+       c. 创建新 session。
+    """
+
+    def conversation_key(self, message: IncomingMessage) -> str:
+        if message.group_id:
+            return f"{message.channel}:group:{message.group_id}"
+
+        if message.receiver_id:
+            a, b = sorted([message.sender_id, message.receiver_id])
+            return f"{message.channel}:private:{a}:{b}"
+
+        return f"{message.channel}:private:{message.sender_id}"
+
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        key = self.conversation_key(message)
+
+        # ────────────────────────────────────────────
+        # Step 1: 把当前会话下超时的 active 标记为 expired
+        # ────────────────────────────────────────────
+        state_store.mark_expired_sessions(
+            conn,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            conversation_key=key,
+        )
+
+        # ────────────────────────────────────────────
+        # Step 2: 查找仍然活跃的 session
+        # ────────────────────────────────────────────
+        active_session = state_store.find_active_session(
+            conn,
+            conversation_key=key,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        if active_session:
+            return SessionResolutionResult(
+                session=active_session,
+                created=False,
+                settled_session=None,
+                settled_drafts=[],
+            )
+
+        # ────────────────────────────────────────────
+        # Step 3: 结算所有 expired 的 session
+        # ────────────────────────────────────────────
+        settled_results = state_store.settle_expired_sessions_for_conversation(
+            conn,
+            conversation_key=key,
+            close_reason=state_store.CLOSE_REASON_NEW_SESSION,
+            reasoning="settle before opening new session",
+        )
+
+        # 取最近一个结算结果返回给前端
+        settled_session = None
+        settled_drafts = []
+
+        if settled_results:
+            settled_session, settled_drafts = settled_results[0]
+
+        # ────────────────────────────────────────────
+        # Step 4: 创建新 session
+        # ────────────────────────────────────────────
+        new_session = state_store.create_session(
+            conn,
+            conversation_key=key,
+            channel=message.channel,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        return SessionResolutionResult(
+            session=new_session,
+            created=True,
+            settled_session=settled_session,
+            settled_drafts=settled_drafts,
+        )
+```
+
+---
+
+# 六、`src/api.py` 新增接口
+
+在原有接口基础上，新增以下接口：
+
+## 6.1 手动结算
+
+```python
+@router.post(
+    "/sessions/{session_id}/settle",
+    response_model=SessionSettleResult,
+)
+def api_settle_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    手动结算一个 session。
+
+    结算后状态为 closed。
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_MANUAL,
+            reasoning=reason or "manual settle",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+```
+
+## 6.2 用户取消
+
+```python
+@router.post(
+    "/sessions/{session_id}/cancel",
+    response_model=SessionSettleResult,
+)
+def api_cancel_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    用户主动取消一个 session。
+
+    与 /settle 的区别：
+    - /settle 结算后状态为 closed
+    - /cancel 结算后状态为 cancelled
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_USER_CANCEL,
+            reasoning=reason or "user cancel",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+```
+
+## 6.3 手动触发维护（调试用）
+
+```python
+@router.post("/maintenance/run")
+def api_run_maintenance():
+    """
+    手动触发一次维护任务（调试用）。
+
+    生产环境由后台轮询自动执行。
+    """
+    from .maintenance import run_maintenance_sync
+
+    result = run_maintenance_sync()
+
+    return {
+        "status": "ok",
+        "marked_expired": result["marked_expired"],
+        "settled": result["settled"],
+    }
+```
+
+---
+
+# 七、新增 `src/maintenance.py`
+
+```python
+"""
+后台维护任务：
+1. 标记过期 session
+2. 结算 expired session
+
+这是纯 CPU 工作，不涉及 LLM API。
+"""
+
+import logging
+from typing import Optional
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .db import get_db
+
+
+logger = logging.getLogger(__name__)
+
+
+def run_maintenance_sync(
+    conversation_key: Optional[str] = None,
+) -> dict:
+    """
+    执行一次维护任务（同步版本）。
+
+    流程：
+    1. 把超时的 active session 标记为 expired；
+    2. 结算所有 expired 的 session。
+
+    返回：
+        {
+            "marked_expired": int,
+            "settled": int,
+        }
+    """
+    with get_db() as conn:
+        # Step 1: 标记过期
+        marked = state_store.mark_expired_sessions(
+            conn,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            conversation_key=conversation_key,
+        )
+
+        # Step 2: 结算
+        results = state_store.settle_all_expired_sessions(
+            conn,
+            close_reason=state_store.CLOSE_REASON_TIMEOUT_POLL,
+            reasoning="session expired (poll)",
+        )
+
+        settled = len(results)
+
+        if marked > 0 or settled > 0:
+            logger.info(
+                "Maintenance: marked %d expired, settled %d sessions",
+                marked,
+                settled,
+            )
+
+        return {
+            "marked_expired": marked,
+            "settled": settled,
+        }
+```
+
+---
+
+# 八、修改 `main.py`
+
+```python
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from src.api import router
+from src.db import init_db
+from src.feedback_store import init_feedback_db
+from src.maintenance import run_maintenance_sync
+
+
+logger = logging.getLogger(__name__)
+
+# 轮询间隔（秒）
+MAINTENANCE_INTERVAL_SECONDS = 30
+
+
+async def maintenance_loop() -> None:
+    """
+    后台轮询任务：
+    每隔 MAINTENANCE_INTERVAL_SECONDS 秒执行一次维护。
+    """
+    while True:
+        try:
+            result = await asyncio.to_thread(run_maintenance_sync)
+
+            if result["marked_expired"] > 0 or result["settled"] > 0:
+                logger.info(
+                    "Maintenance loop: marked=%d, settled=%d",
+                    result["marked_expired"],
+                    result["settled"],
+                )
+
+        except Exception:
+            logger.exception("Maintenance loop failed")
+
+        await asyncio.sleep(MAINTENANCE_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化数据库
+    init_db()
+    init_feedback_db()
+
+    # 启动后台维护任务
+    maintenance_task = asyncio.create_task(maintenance_loop())
+
+    logger.info(
+        "Maintenance loop started (interval=%ds)",
+        MAINTENANCE_INTERVAL_SECONDS,
+    )
+
+    yield
+
+    # 关闭后台任务
+    maintenance_task.cancel()
+    try:
+        await maintenance_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="Trade Dialogue DST",
+    description="多轮交易对话状态追踪与增量 NER 服务",
+    version="0.4.0",
+    lifespan=lifespan,
+)
+
+app.include_router(router, tags=["dst"])
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+---
+
+# 九、结算逻辑总结
+
+## 9.1 状态机
+
+```
+                    ┌─────────────────┐
+        create ──►  │     active      │
+                    └────────┬────────┘
+                             │
+              timeout 检测    │    用户主动取消
+                             ▼
+                    ┌─────────────────┐         ┌──────────────┐
+                    │     expired     │         │  cancelled   │
+                    └────────┬────────┘         └──────────────┘
+                             │                        ▲
+                             │ settle                 │
+                             ▼                        │
+                    ┌─────────────────┐               │
+                    │     closed      │───────────────┘
+                    └─────────────────┘   （仅用户取消时走这条）
+```
+
+## 9.2 结算触发时机
+
+| 触发点 | 时机 | 触发方式 | close_reason |
+|---|---|---|---|
+| **T1. 新消息触发** | 新消息需要开新 session 时 | `SessionResolver.resolve()` | `new_session` |
+| **T2. 轮询触发** | 后台定时扫描 | `maintenance_loop` | `timeout_poll` |
+| **T3. 手动触发** | 前端点击"结束会话" | `POST /sessions/{id}/settle` | `manual` |
+| **T4. 用户取消** | 用户明确说"取消" | `POST /sessions/{id}/cancel` | `user_cancel` |
+
+## 9.3 `is_complete` 判断位置
+
+```text
+Session 上：
+    - status: active / expired / closed / cancelled
+    - close_reason: new_session / timeout_poll / manual / user_cancel
+    - settled_at: 结算时间
+    - 没有 is_complete
+
+TradeDraft 上：
+    - is_complete: true / false
+    - 结算时独立判断每个 draft
+```
+
+## 9.4 结算规则
+
+```text
+对每个 trade_draft：
+
+1. 检查 REQUIRED_SETTLE_FIELDS 是否都有值
+
+2. 如果所有字段都有值：
+   - is_complete = true
+   - 将所有 proposed / confirmed 状态的 slot 改成 confirmed
+   - 其他状态不动
+
+3. 如果存在字段缺失：
+   - is_complete = false
+   - 将缺失字段的 slot_status 改成 unknown
+   - 其他已有字段状态不动
+
+4. 写回数据库
+5. 写入 SETTLE 事件
+```
+
+## 9.5 结算后返回示例
+
+```json
+{
+  "session": {
+    "session_id": "session_old",
+    "status": "closed",
+    "close_reason": "timeout_poll",
+    "settled_at": "2026-06-22T10:30:00Z"
+  },
+  "drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "amount": 2000,
+      "price": 100.85,
+      "is_complete": true,
+      "slots": {
+        "asset_name": {
+          "value": "24长发",
+          "status": "confirmed"
+        },
+        "amount": {
+          "value": 2000,
+          "status": "confirmed"
+        },
+        "price": {
+          "value": 100.85,
+          "status": "confirmed"
+        }
+      }
+    },
+    {
+      "draft_id": "draft_2",
+      "asset_name": "25诚通",
+      "amount": 1000,
+      "price": null,
+      "is_complete": false,
+      "slots": {
+        "asset_name": {
+          "value": "25诚通",
+          "status": "confirmed"
+        },
+        "amount": {
+          "value": 1000,
+          "status": "confirmed"
+        },
+        "price": {
+          "value": null,
+          "status": "unknown"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+# 十、关键设计决策总结
+
+| 决策 | 理由 |
+|---|---|
+| `is_complete` 放在 `TradeDraft` 上 | 一个 session 内可能有多个 draft，每个 draft 完整性独立 |
+| `Session` 只记录 `close_reason` 和 `settled_at` | Session 是协商上下文，不关心具体字段完整性 |
+| 引入 `expired` 中间态 | 区分"刚超时"和"刚创建"，轮询任务只扫 `expired` |
+| 结算是纯 CPU 工作 | 不涉及 LLM，可以随时安全执行 |
+| 四路触发兜底 | 确保每个 session 最终都会进入终态 |
+| 幂等设计 | 已经是终态的 session 再次结算直接返回，不重复处理 |
+
