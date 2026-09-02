@@ -13470,3 +13470,883 @@ process_message()                        [src/service.py]
 
 `apply_action()` 和 `resolve_target()` **不需要改**，它们只负责处理增量 `Action`，与结算逻辑完全解耦。
 
+
+---
+🙋**user**:
+---
+```
+def resolve(self, conn, message: IncomingMessage) -> SessionResolutionResult:
+    key = self.conversation_key(message)
+    state_store.mark_expired_sessions(
+        conn,
+        timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        conversation_key=key,
+    )
+    active_session = state_store.find_active_session(
+        conn,
+        conversation_key=key,
+        timeout_minutes=SESSION_TIMEOUT_MINUTES,
+    )
+    if active_session:
+        return SessionResolutionResult(
+            session=active_session,
+            created=False,
+            settled_session=None,
+            settled_drafts=[],
+        )
+    settled_results = state_store.settle_expired_sessions_for_conversation(
+        conn,
+        conversation_key=key,
+        close_reason=state_store.CLOSE_REASON_NEW_SESSION,
+        reasoning="settle before opening new session",
+    )
+    settled_session = None
+    settled_drafts = []
+    if settled_results:
+        settled_session, settled_drafts = settled_results[0]
+    new_session = state_store.create_session(
+        conn,
+        conversation_key=key,
+        channel=message.channel,
+        timeout_minutes=SESSION_TIMEOUT_MINUTES,
+    )
+
+    return SessionResolutionResult(
+        session=new_session,
+        created=True,
+        settled_session=settled_session,
+        settled_drafts=settled_drafts,
+    )
+你这块session resolve的逻辑有问题，不符合我提出的要求。
+你当前的逻辑是：
+当新消息进来时，先根据SESSION_TIMEOUT_MINUTES去判断前面所有session是否expired。如果还有active的会话，那么拿出最新最近的session作为新消息的会话，不在这里对expired会话作结算，直接返回最新的active会话。
+如果没有active会话了，才结算所有expired会话，并返回最近的那一个作为结算结果，新建new session，返回其与结算结果。
+除了新消息触发之外，轮询也会定时判断sessions是否超出SESSION_TIMEOUT_MINUTES，若超出则判断其expired，然后结算这些expired sessions。
+
+那总结起来，其实会话session是否过期，本质是看最新session的now 与 updated_at 是否超过 SESSION_TIMEOUT_MINUTES，而与新消息无关。
+
+我的要求是：
+当新消息进来时，根据它固有属性（比如是否换话题、是否换sender/receiver等）去判断要不要开启一个新会话new session。
+如果要开启，那么将前一个尚未结算的会话，无论其处于active还是expired，无论其now 与 updated_at 是否超过 SESSION_TIMEOUT_MINUTES，都判其expired并执行结算，同时开启下一个session。
+也就是说这里它该执行以下三个步骤：1 寻找前一个尚未结算的会话，2 若其status为active, 改为expired。结算之得到结算结果，3 创建新session，返回这个新session和前一个session结算结果。
+如果不需要开启，也就是说新消息的固有属性决定了它属于前一个active的会话，那么无需结算，也无需开启new session。但是考虑到轮询任务会定期判断并结算超出SESSION_TIMEOUT_MINUTES的会话，所以这里新消息可能拿不到前一个active的会话。
+这种情况该怎么处理呢？我有个想法，是不是判断新消息是否需要开启new session，应该先去拿上一个active session，然后将新消息与这个active session放一起判断？也就是这样：
+
+当新消息进来时，先去取最接近的上一个session——last session。分情况讨论：
+情况1: 这个session已经被结算, status=settled. 那么新开一个new session, 返回new session
+情况2: 这个session未被结算, 但status=expired. 其实按理不应该出现这种情况因为整个项目里, 对session判expired之后都会马上结算. 不过还是兜底考虑这种情况, 这里结算last session, 创建new session, 返回 new session和 last session的settle result.
+情况3: 这个session未被结算, status=active, 那么此时应该首先检查now与updated_at是否已经超过了SESSION_TIMEOUT_MINUTES. 如果已经超过, 说明其本质已经expired但尚未被轮询扫描到罢了。那么将其status设为expired之后, 再执行情况2; 如果未超过, 那就是情况4
+情况4: 这个session未被结算, status=active, 且now与updated_at未超过SESSION_TIMEOUT_MINUTES. 那说明它是真active. 那么首先算法判断 新消息与last session是否属于同一个会话，如果确实属于, 那么直接返回 last session, 没有结算结果; 如果不属于, 那就是情况5
+情况5: 这个session未被结算, status=active而且经过SESSION_TIMEOUT_MINUTES检查是真的，且算法判断新消息与last session不属于同一个会话. 那么首先将last session判定为expired, 然后结算它, 然后创建new session, 并返回new session和 last session的settle result.
+应该没有遗漏了哈？
+```
+
+---
+🤖**assistant**:
+---
+
+你的五种情况分析非常完整，没有遗漏。我下面基于你的逻辑重写 `session_resolver.py`，同时在 `state_store.py` 中补充必要的辅助函数。
+
+---
+
+# 一、你的逻辑梳理（确认无遗漏）
+
+```
+新消息进来
+    │
+    ▼
+取 last_session（该 conversation_key 下最新的 session）
+    │
+    ├── last_session 不存在（第一条消息）
+    │       → 直接创建 new_session，返回
+    │
+    ├── 情况1: status ∈ {closed, cancelled}（已结算/终态）
+    │       → 创建 new_session，返回
+    │
+    ├── 情况2: status == expired（兜底，正常不应出现）
+    │       → 结算 last_session
+    │       → 创建 new_session
+    │       → 返回 new_session + settle_result
+    │
+    ├── 情况3: status == active，但 now - updated_at > TIMEOUT
+    │       → 本质已过期，先标为 expired
+    │       → 走情况2（结算 + 新开）
+    │
+    ├── 情况4: status == active，未超时，且属于同一会话
+    │       → 直接返回 last_session，无结算
+    │
+    └── 情况5: status == active，未超时，但不属于同一会话
+            → 标为 expired
+            → 结算 last_session
+            → 创建 new_session
+            → 返回 new_session + settle_result
+```
+
+**没有遗漏。** 唯一补充一个前置：`last_session` 不存在时直接创建。
+
+---
+
+# 二、需要新增的 `state_store.py` 函数
+
+在 `src/state_store.py` 中新增两个函数：
+
+## 2.1 `find_latest_session`
+
+```python
+def find_latest_session(
+    conn,
+    conversation_key: str,
+) -> Optional[Session]:
+    """
+    查找该会话键下最新的 session（无论状态）。
+
+    用于 SessionResolver 取"上一个 session"。
+    """
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        WHERE conversation_key = ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (conversation_key,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+```
+
+## 2.2 `mark_session_expired`
+
+```python
+def mark_session_expired(
+    conn,
+    session_id: str,
+) -> None:
+    """
+    将单个 session 标记为 expired。
+
+    仅当当前状态为 active 时才生效（防御性）。
+    """
+    now = utcnow()
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = ?, updated_at = ?
+        WHERE session_id = ?
+          AND status = ?
+        """,
+        (
+            SESSION_EXPIRED,
+            iso(now),
+            session_id,
+            SESSION_ACTIVE,
+        ),
+    )
+```
+
+---
+
+# 三、`src/session_resolver.py` 完整重写
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from datetime import timedelta
+from typing import Optional, Tuple, List
+
+from . import state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .models import (
+    IncomingMessage,
+    Session,
+    SessionResolutionResult,
+    TradeDraft,
+)
+from .state_store import utcnow
+
+
+# ────────────────────────────────────────────
+# 会话归属判断接口
+# ────────────────────────────────────────────
+
+class SessionBelongJudge(ABC):
+    """
+    判断新消息是否属于某个已有会话。
+
+    这是你后续扩展"换话题检测"、"换人检测"等逻辑的入口。
+
+    默认实现：同一个 conversation_key 下的消息一律视为属于。
+    你可以替换为：
+      - 关键词规则（"另外"、"新交易"、"换个话题"）
+      - 调用小模型判断语义是否连续
+      - 检查 sender/receiver 组合是否变化
+    """
+
+    @abstractmethod
+    def belongs(
+        self,
+        conn,
+        message: IncomingMessage,
+        session: Session,
+    ) -> bool:
+        raise NotImplementedError
+
+
+class DefaultSessionBelongJudge(SessionBelongJudge):
+    """
+    默认实现：同 conversation_key 下的消息一律属于同一会话。
+
+    即：只要消息能通过 conversation_key 找到这个 session，
+    就认为它属于这个 session。
+
+    如果你需要"换话题检测"，请继承此类并覆盖 belongs()。
+    """
+
+    def belongs(
+        self,
+        conn,
+        message: IncomingMessage,
+        session: Session,
+    ) -> bool:
+        return True
+
+
+# ────────────────────────────────────────────
+# SessionResolver 接口
+# ────────────────────────────────────────────
+
+class SessionResolver(ABC):
+    """
+    SessionResolver 接口。
+
+    职责：
+    1. 判断当前消息属于哪个会话；
+    2. 如果需要新开，先结算上一个未结算会话；
+    3. 创建新会话。
+    """
+
+    @abstractmethod
+    def conversation_key(self, message: IncomingMessage) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        raise NotImplementedError
+
+
+# ────────────────────────────────────────────
+# 默认实现
+# ────────────────────────────────────────────
+
+class DefaultSessionResolver(SessionResolver):
+    """
+    默认 SessionResolver。
+
+    核心逻辑（对应你提出的 5 种情况）：
+
+    前置: last_session 不存在 → 直接创建
+    情况1: last_session 已结算（终态）→ 新开
+    情况2: last_session status=expired（兜底）→ 结算 + 新开
+    情况3: last_session active 但超时 → 标为 expired → 走情况2
+    情况4: last_session active 未超时，属于同一会话 → 复用
+    情况5: last_session active 未超时，不属于同一会话 → 标为 expired → 结算 + 新开
+    """
+
+    def __init__(self, belong_judge: Optional[SessionBelongJudge] = None):
+        self.belong_judge = belong_judge or DefaultSessionBelongJudge()
+
+    # ────────────────────────────────────────
+    # conversation_key
+    # ────────────────────────────────────────
+
+    def conversation_key(self, message: IncomingMessage) -> str:
+        if message.group_id:
+            return f"{message.channel}:group:{message.group_id}"
+
+        if message.receiver_id:
+            a, b = sorted([message.sender_id, message.receiver_id])
+            return f"{message.channel}:private:{a}:{b}"
+
+        return f"{message.channel}:private:{message.sender_id}"
+
+    # ────────────────────────────────────────
+    # 超时判断
+    # ────────────────────────────────────────
+
+    @staticmethod
+    def _is_timed_out(session: Session) -> bool:
+        """
+        判断 session 是否实际已超时。
+
+        规则：now - updated_at > SESSION_TIMEOUT_MINUTES
+        """
+        if session.updated_at is None:
+            return True
+
+        now = utcnow()
+
+        # 处理时区：如果 updated_at 是 naive datetime，视为 UTC
+        updated = session.updated_at
+        if updated.tzinfo is None:
+            from datetime import timezone
+            updated = updated.replace(tzinfo=timezone.utc)
+
+        elapsed = now - updated
+        return elapsed > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+
+    # ────────────────────────────────────────
+    # 辅助：结算旧会话 + 创建新会话
+    # ────────────────────────────────────────
+
+    def _settle_and_create_new(
+        self,
+        conn,
+        conversation_key: str,
+        message: IncomingMessage,
+        last_session: Session,
+    ) -> SessionResolutionResult:
+        """
+        结算 last_session，创建新 session，返回结果。
+
+        被情况2、情况3、情况5共用。
+        """
+        # 结算旧会话
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=last_session.session_id,
+            message_id=message.message_id,
+            close_reason=state_store.CLOSE_REASON_NEW_SESSION,
+            reasoning="settle before opening new session",
+        )
+
+        # 创建新会话
+        new_session = state_store.create_session(
+            conn,
+            conversation_key=conversation_key,
+            channel=message.channel,
+            timeout_minutes=SESSION_TIMEOUT_MINUTES,
+        )
+
+        return SessionResolutionResult(
+            session=new_session,
+            created=True,
+            settled_session=settled_session,
+            settled_drafts=settled_drafts,
+        )
+
+    # ────────────────────────────────────────
+    # 核心：resolve
+    # ────────────────────────────────────────
+
+    def resolve(
+        self,
+        conn,
+        message: IncomingMessage,
+    ) -> SessionResolutionResult:
+        key = self.conversation_key(message)
+
+        # ────────────────────────────────────
+        # 取 last_session（该会话键下最新的，无论状态）
+        # ────────────────────────────────────
+        last_session = state_store.find_latest_session(
+            conn,
+            conversation_key=key,
+        )
+
+        # ────────────────────────────────────
+        # 前置：没有任何 session（第一条消息）
+        # ────────────────────────────────────
+        if last_session is None:
+            new_session = state_store.create_session(
+                conn,
+                conversation_key=key,
+                channel=message.channel,
+                timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            )
+            return SessionResolutionResult(
+                session=new_session,
+                created=True,
+                settled_session=None,
+                settled_drafts=[],
+            )
+
+        # ────────────────────────────────────
+        # 情况1: 已结算（终态）
+        # status ∈ {closed, cancelled}
+        # → 直接新开，无结算
+        # ────────────────────────────────────
+        if last_session.status in state_store.TERMINAL_STATUSES:
+            new_session = state_store.create_session(
+                conn,
+                conversation_key=key,
+                channel=message.channel,
+                timeout_minutes=SESSION_TIMEOUT_MINUTES,
+            )
+            return SessionResolutionResult(
+                session=new_session,
+                created=True,
+                settled_session=None,
+                settled_drafts=[],
+            )
+
+        # ────────────────────────────────────
+        # 情况2: status == expired（兜底）
+        # 正常不应出现，因为标完 expired 会立刻结算。
+        # 但防御性处理：结算它，新开。
+        # ────────────────────────────────────
+        if last_session.status == state_store.SESSION_EXPIRED:
+            return self._settle_and_create_new(
+                conn, key, message, last_session,
+            )
+
+        # ────────────────────────────────────
+        # 到这里，last_session.status 只能是 active
+        # ────────────────────────────────────
+
+        # ────────────────────────────────────
+        # 情况3: active 但实际已超时
+        # 本质已过期，只是轮询还没扫到。
+        # → 先标为 expired，再走情况2（结算 + 新开）
+        # ────────────────────────────────────
+        if self._is_timed_out(last_session):
+            state_store.mark_session_expired(
+                conn,
+                last_session.session_id,
+            )
+            return self._settle_and_create_new(
+                conn, key, message, last_session,
+            )
+
+        # ────────────────────────────────────
+        # 到这里：
+        # last_session.status == active
+        # 且 now - updated_at <= SESSION_TIMEOUT_MINUTES
+        # 即"真 active"
+        # ────────────────────────────────────
+
+        # ────────────────────────────────────
+        # 情况4 / 情况5：判断新消息是否属于这个会话
+        # ────────────────────────────────────
+        belongs = self.belong_judge.belongs(
+            conn,
+            message,
+            last_session,
+        )
+
+        if belongs:
+            # ────────────────────────────────
+            # 情况4: 属于同一会话
+            # → 直接复用，无结算，无新开
+            # ────────────────────────────────
+            return SessionResolutionResult(
+                session=last_session,
+                created=False,
+                settled_session=None,
+                settled_drafts=[],
+            )
+        else:
+            # ────────────────────────────────
+            # 情况5: 不属于同一会话
+            # → 标为 expired → 结算 → 新开
+            # ────────────────────────────────
+            state_store.mark_session_expired(
+                conn,
+                last_session.session_id,
+            )
+            return self._settle_and_create_new(
+                conn, key, message, last_session,
+            )
+```
+
+---
+
+# 四、`src/api.py` 中 `get_session_resolver` 的适配
+
+由于 `DefaultSessionResolver` 现在接受一个可选的 `belong_judge` 参数，`api.py` 中的工厂函数可以这样写：
+
+```python
+def get_session_resolver() -> SessionResolver:
+    """
+    构造 SessionResolver。
+
+    如果你需要自定义"换话题检测"逻辑，
+    在这里替换 belong_judge 即可：
+
+        from .session_resolver import MyCustomBelongJudge
+        return DefaultSessionResolver(
+            belong_judge=MyCustomBelongJudge()
+        )
+    """
+    return DefaultSessionResolver()
+```
+
+---
+
+# 五、`src/service.py` 不需要改
+
+`process_message()` 调用的是：
+
+```python
+resolution = resolver.resolve(conn, message)
+```
+
+它只关心返回的 `SessionResolutionResult`，不关心内部是哪种情况触发的。所以 `service.py` 完全不需要改。
+
+---
+
+# 六、五种情况与代码的对应关系
+
+| 情况 | 条件 | 代码位置 | 动作 |
+|---|---|---|---|
+| 前置 | `last_session is None` | `if last_session is None:` | 直接创建 |
+| 情况1 | `status ∈ {closed, cancelled}` | `if last_session.status in TERMINAL_STATUSES:` | 直接创建，无结算 |
+| 情况2 | `status == expired` | `if last_session.status == SESSION_EXPIRED:` | 结算 + 创建 |
+| 情况3 | `status == active` 且超时 | `if self._is_timed_out(last_session):` | 标为 expired → 结算 + 创建 |
+| 情况4 | `status == active`，未超时，属于 | `if belongs:` | 复用，无结算 |
+| 情况5 | `status == active`，未超时，不属于 | `else:` | 标为 expired → 结算 + 创建 |
+
+---
+
+# 七、`SessionBelongJudge` 扩展示例
+
+如果后续你想加"换话题检测"，只需要继承 `SessionBelongJudge`：
+
+```python
+class KeywordSessionBelongJudge(SessionBelongJudge):
+    """
+    基于关键词的换话题检测。
+
+    如果消息中出现"新交易"、"另外一笔"、"换个"等关键词，
+    则认为不属于当前会话。
+    """
+
+    NEW_TOPIC_KEYWORDS = [
+        "新交易",
+        "另外一笔",
+        "另外",
+        "换个",
+        "新的",
+        "再开",
+        "开个新的",
+    ]
+
+    def belongs(
+        self,
+        conn,
+        message: IncomingMessage,
+        session: Session,
+    ) -> bool:
+        content_lower = message.content.lower()
+
+        for keyword in self.NEW_TOPIC_KEYWORDS:
+            if keyword in content_lower:
+                return False
+
+        return True
+```
+
+然后在 `get_session_resolver` 中注入：
+
+```python
+def get_session_resolver() -> SessionResolver:
+    return DefaultSessionResolver(
+        belong_judge=KeywordSessionBelongJudge()
+    )
+```
+
+---
+
+# 八、轮询任务与 `resolve` 的关系
+
+你提到：
+
+> 轮询也会定时判断 sessions 是否超出 SESSION_TIMEOUT_MINUTES，若超出则判断其 expired，然后结算这些 expired sessions。
+
+轮询任务（`maintenance.py`）的逻辑不变：
+
+```text
+每 30 秒：
+    1. mark_expired_sessions()  → 把所有超时的 active 标为 expired
+    2. settle_all_expired_sessions() → 结算所有 expired
+```
+
+`resolve` 中的情况3是**防御性兜底**：
+
+```text
+如果轮询还没来得及跑，
+但新消息进来了，
+resolve 自己发现"这个 active 其实已经超时了"，
+就当场标为 expired 并结算。
+```
+
+两者互不冲突，互为兜底。
+
+---
+
+# 九、总结
+
+你的五种情况**没有遗漏**，逻辑自洽。核心改动只有两个文件：
+
+| 文件 | 改动 |
+|---|---|
+| `src/state_store.py` | 新增 `find_latest_session()`、`mark_session_expired()` |
+| `src/session_resolver.py` | 完全重写，实现 5 种情况 + `SessionBelongJudge` 接口 |
+
+`service.py`、`api.py`、`models.py`、`maintenance.py`、`main.py` 均不需要改。
+
+
+---
+🙋**user**:
+---
+```
+会话键conversation_key到底是什么？我理解是join session with messages的join key。
+但为什么find_last_session要用到conversation_key：查找该会话键下的最新session？为什么不可以是时间意义上的最近session呢？
+```
+
+---
+🤖**assistant**:
+---
+
+你的质疑非常到位。让我把 `conversation_key` 的角色彻底讲清楚。
+
+---
+
+# 一、先纠正一个理解
+
+你说：
+
+> `conversation_key` 是 join session with messages 的 join key。
+
+这个理解不太对。
+
+**真正的 join key 是 `session_id`。**
+
+```text
+messages.session_id  →  sessions.session_id
+```
+
+这是"某条消息属于哪个 session"的关联。
+
+`conversation_key` 不是 join key，它是一个**路由键 / 分区键**，作用是：
+
+> **把不同通信通道的消息隔离开。**
+
+---
+
+# 二、`conversation_key` 到底是什么
+
+它回答的问题是：
+
+> **这条消息来自哪个通信通道？**
+
+生成规则：
+
+```text
+私聊：  {channel}:private:{sorted(sender_id, receiver_id)}
+群聊：  {channel}:group:{group_id}
+```
+
+例如：
+
+```text
+qq:private:trader_A:trader_B
+qq:group:8899
+```
+
+它标识的是 **"谁和谁在哪个渠道聊天"**，而不是"哪次交易协商"。
+
+---
+
+# 三、为什么不能用"全局时间最新的 session"
+
+这是你问题的核心。
+
+## 3.1 反例
+
+假设系统同时服务多对交易员：
+
+```text
+10:00  trader_A → trader_B: "24长发有量吗？"
+       conversation_key = "qq:private:A:B"
+       → 创建 session_1
+
+10:05  trader_C → trader_D: "25诚通什么价？"
+       conversation_key = "qq:private:C:D"
+       → 创建 session_2
+
+10:10  trader_A → trader_B: "前者量加到2000"
+       conversation_key = "qq:private:A:B"
+       → 应该找到 session_1
+```
+
+如果用"全局时间最新"：
+
+```text
+全局最新 = session_2（trader_C-D 的）
+```
+
+这就错了。这条消息应该属于 `session_1`（trader_A-B 的），不是 `session_2`。
+
+## 3.2 结论
+
+**必须用 `conversation_key` 过滤**，确保只在"同一对通信方"的范围内查找。
+
+---
+
+# 四、那如果你的系统只有一个通信通道呢？
+
+如果你的业务场景里：
+
+```text
+所有消息都来自同一个群
+或者只有一对交易员在聊天
+```
+
+那 `conversation_key` 对所有消息都一样，过滤不过滤结果确实一样。
+
+但从架构设计上，保留它是更安全的，因为：
+
+1. **未来可能扩展到多通道**
+2. **不影响性能**（有索引）
+3. **语义清晰**
+
+---
+
+# 五、`conversation_key` 和 `session_id` 的关系
+
+一个 `conversation_key` 下可以有多个 `session`，按时间顺序排列：
+
+```text
+conversation_key = "qq:private:A:B"
+
+  session_1 (closed)      ← 第一次交易协商
+  session_2 (closed)      ← 第二次交易协商
+  session_3 (active)      ← 当前正在进行的协商
+```
+
+它们之间的关系是：
+
+```text
+conversation_key  →  通信通道（谁和谁在聊）
+session_id        →  一次交易协商（聊的是哪笔/哪几笔交易）
+```
+
+一个通信通道里，交易员可能先聊完一笔，再聊下一笔。每次"换话题"或"超时"就会开新 session。
+
+---
+
+# 六、`find_latest_session` 为什么用 `conversation_key`
+
+```python
+def find_latest_session(conn, conversation_key):
+    """
+    查找该通信通道下最新的 session（无论状态）。
+    """
+```
+
+它做的事情是：
+
+```text
+在"这对交易员"的通信通道内，找到最近的一个 session。
+```
+
+而不是：
+
+```text
+在全系统所有交易员的所有通信通道里，找到最近的一个 session。
+```
+
+后者会跨通道误匹配。
+
+---
+
+# 七、用一张图总结
+
+```text
+┌─────────────────────────────────────────────────────┐
+│  conversation_key = "qq:private:A:B"                │
+│                                                     │
+│  session_1 (closed)                                 │
+│    ├── draft_1: 24长发                              │
+│    └── draft_2: 25诚通                              │
+│                                                     │
+│  session_2 (closed)                                 │
+│    └── draft_3: 23城投                              │
+│                                                     │
+│  session_3 (active)  ← find_latest_session 找到这个 │
+│    └── draft_4: 24长发                              │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│  conversation_key = "qq:private:C:D"                │
+│                                                     │
+│  session_4 (active)  ← 不会被 A-B 的消息匹配到     │
+│    └── draft_5: 25诚通                              │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+当 `trader_A → trader_B` 发来新消息时：
+
+```text
+1. 生成 conversation_key = "qq:private:A:B"
+2. 在这个 key 下找最新 session → session_3
+3. 不会误匹配到 session_4（那是 C-D 的）
+```
+
+---
+
+# 八、如果你确实只有一个通道，能不能简化？
+
+可以。如果你确定系统只服务一个通信通道，可以：
+
+```python
+def find_latest_session(conn):
+    """
+    全局最新的 session。
+    """
+    row = conn.execute(
+        """
+        SELECT *
+        FROM sessions
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return row_to_session(row)
+```
+
+但我不建议这样做，因为：
+
+1. 一旦未来扩展到多通道，就要改回来
+2. `conversation_key` 的过滤成本极低（有索引）
+3. 保留它让代码语义更清晰
+
+---
+
+# 九、总结
+
+| 概念 | 作用 | 类比 |
+|---|---|---|
+| `conversation_key` | 通信通道标识（谁和谁在哪个渠道聊） | 电话号码 |
+| `session_id` | 一次交易协商标识（聊的是哪笔交易） | 一次通话 |
+| `draft_id` | 一笔交易草稿 | 通话中讨论的一个具体事项 |
+| `message_id` | 一条消息 | 通话中的一句话 |
+
+**`conversation_key` 不是 join key，是路由键。**
+
+**`find_latest_session` 必须用 `conversation_key` 过滤，否则会跨通道误匹配。**
+
