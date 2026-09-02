@@ -12476,3 +12476,997 @@ TradeDraft 上：
 | 四路触发兜底 | 确保每个 session 最终都会进入终态 |
 | 幂等设计 | 已经是终态的 session 再次结算直接返回，不重复处理 |
 
+
+---
+🙋**user**:
+---
+```
+你是不是忘记修改主要核心接口 api_process_message 以及背后的service.py文件里的 process_message、apply_action等方核心方法了？
+```
+
+---
+🤖**assistant**:
+---
+
+你说得对，我确实遗漏了。`SessionResolver.resolve()` 的返回类型从 `Session` 变成了 `SessionResolutionResult`，这会直接影响 `service.py` 的 `process_message` 以及 `api.py` 的 `api_process_message`。下面把这两个文件完整补齐。
+
+---
+
+# 一、影响分析
+
+`resolve()` 返回类型变化后，调用链上受影响的位置：
+
+```text
+api.py  →  api_process_message()
+                    ↓
+service.py  →  process_message()
+                    ↓
+session_resolver.py  →  resolve()  ← 返回类型变了
+```
+
+具体影响：
+
+| 文件 | 函数 | 影响 |
+|---|---|---|
+| `src/service.py` | `process_message()` | 需要适配 `SessionResolutionResult`，传递 `settled_session` / `settled_drafts` |
+| `src/api.py` | `api_process_message()` | 返回模型 `ProcessResult` 已更新，但需要确认导入 |
+| `src/api.py` | `api_resolve_session()` | 返回模型从 `SessionResolveResult` 改为 `SessionResolutionResult` |
+| `src/service.py` | `apply_action()` | **不需要改**，它只处理 `Action`，与结算无关 |
+| `src/service.py` | `resolve_target()` | **不需要改** |
+
+---
+
+# 二、`src/service.py` 完整替换
+
+```python
+from __future__ import annotations
+
+from typing import List, Optional
+
+from . import state_store
+from .db import get_db
+from .llm import ActionExtractor
+from .models import (
+    Action,
+    ActionTarget,
+    ActionType,
+    IncomingMessage,
+    ProcessResult,
+    TradeDraft,
+)
+from .session_resolver import SessionResolver
+
+
+def resolve_target(
+    drafts: List[TradeDraft],
+    target: Optional[ActionTarget],
+) -> Optional[TradeDraft]:
+    """
+    根据 ActionTarget 定位到具体的 TradeDraft。
+
+    匹配优先级：
+    1. draft_id 精确匹配
+    2. asset_name 模糊匹配
+    3. asset_code 精确匹配
+    4. ordinal 序号匹配
+    5. reference_expression 指代匹配
+    """
+    if not drafts:
+        return None
+
+    if target:
+        if target.draft_id:
+            for draft in drafts:
+                if draft.draft_id == target.draft_id:
+                    return draft
+
+        if target.asset_name:
+            lower_target = target.asset_name.lower()
+            for draft in drafts:
+                if not draft.asset_name:
+                    continue
+
+                lower_name = draft.asset_name.lower()
+                if lower_target in lower_name or lower_name in lower_target:
+                    return draft
+
+        if target.asset_code:
+            lower_code = target.asset_code.lower()
+            for draft in drafts:
+                if draft.asset_code and draft.asset_code.lower() == lower_code:
+                    return draft
+
+        if target.ordinal is not None:
+            index = target.ordinal - 1
+            if 0 <= index < len(drafts):
+                return drafts[index]
+
+        if target.reference_expression:
+            ref = target.reference_expression.lower()
+
+            if any(word in ref for word in ["前者", "第一", "第1", "first"]):
+                return drafts[0]
+
+            if any(word in ref for word in ["后者", "最后", "last"]):
+                return drafts[-1]
+
+            if any(word in ref for word in ["这笔", "当前"]):
+                return drafts[-1]
+
+            if any(word in ref for word in ["那笔"]):
+                return drafts[0]
+
+    return None
+
+
+def _get_lookup_target(action: Action) -> ActionTarget:
+    """
+    从 Action 中合并出用于查找草稿的 ActionTarget。
+
+    如果 action.target 为空，但 action.updates 里有 asset_name / asset_code，
+    则自动补充到 target 中。
+    """
+    target = action.target.model_copy() if action.target else ActionTarget()
+
+    if action.updates:
+        if not target.asset_name and action.updates.get("asset_name"):
+            target.asset_name = action.updates["asset_name"]
+
+        if not target.asset_code and action.updates.get("asset_code"):
+            target.asset_code = action.updates["asset_code"]
+
+    return target
+
+
+def apply_action(
+    conn,
+    *,
+    session_id: str,
+    drafts: List[TradeDraft],
+    action: Action,
+    message_id: str,
+) -> Optional[str]:
+    """
+    执行单个 Action，更新数据库。
+
+    返回：
+        如果需要反问用户，返回反问文本；否则返回 None。
+    """
+
+    lookup_target = _get_lookup_target(action)
+
+    # ────────────────────────────────────────────
+    # CREATE
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.CREATE:
+        updates = dict(action.updates or {})
+
+        if lookup_target.asset_name and not updates.get("asset_name"):
+            updates["asset_name"] = lookup_target.asset_name
+
+        if lookup_target.asset_code and not updates.get("asset_code"):
+            updates["asset_code"] = lookup_target.asset_code
+
+        existing = resolve_target(drafts, lookup_target)
+
+        if existing:
+            state_store.update_draft_fields(
+                conn,
+                draft_id=existing.draft_id,
+                updates=updates,
+                message_id=message_id,
+                action_type=ActionType.UPDATE,
+                reasoning=action.reasoning,
+            )
+        else:
+            state_store.create_draft(
+                conn,
+                session_id=session_id,
+                updates=updates,
+                message_id=message_id,
+            )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # UPDATE
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.UPDATE:
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            clarify = "无法定位要更新的交易草稿，请补充标的或指代。"
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=clarify,
+                reasoning=action.reasoning,
+            )
+            return clarify
+
+        if target_draft.status == "confirmed":
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=target_draft.draft_id,
+                message_id=message_id,
+                action_type=ActionType.NOOP,
+                field=None,
+                old_value=None,
+                new_value="draft already confirmed",
+                reasoning="已确认交易默认不允许直接修改",
+            )
+            return None
+
+        state_store.update_draft_fields(
+            conn,
+            draft_id=target_draft.draft_id,
+            updates=action.updates,
+            message_id=message_id,
+            action_type=action.action_type,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # CONFIRM / REJECT / CANCEL
+    # ────────────────────────────────────────────
+    if action.action_type in (
+        ActionType.CONFIRM,
+        ActionType.REJECT,
+        ActionType.CANCEL,
+    ):
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            clarify = "无法定位要确认/取消的交易草稿，请补充标的或指代。"
+            state_store.append_event(
+                conn,
+                session_id=session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=clarify,
+                reasoning=action.reasoning,
+            )
+            return clarify
+
+        status_map = {
+            ActionType.CONFIRM: "confirmed",
+            ActionType.REJECT: "rejected",
+            ActionType.CANCEL: "cancelled",
+        }
+
+        state_store.set_draft_status(
+            conn,
+            draft_id=target_draft.draft_id,
+            status=status_map[action.action_type],
+            message_id=message_id,
+            action_type=action.action_type,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # CLARIFY
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.CLARIFY:
+        clarify = action.reasoning or "请补充信息。"
+        state_store.append_event(
+            conn,
+            session_id=session_id,
+            draft_id=None,
+            message_id=message_id,
+            action_type=ActionType.CLARIFY,
+            field=None,
+            old_value=None,
+            new_value=clarify,
+            reasoning=action.reasoning,
+        )
+        return clarify
+
+    # ────────────────────────────────────────────
+    # NOOP
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.NOOP:
+        state_store.append_event(
+            conn,
+            session_id=session_id,
+            draft_id=None,
+            message_id=message_id,
+            action_type=ActionType.NOOP,
+            field=None,
+            old_value=None,
+            new_value=None,
+            reasoning=action.reasoning,
+        )
+        return None
+
+    return None
+
+
+def process_message(
+    message: IncomingMessage,
+    resolver: SessionResolver,
+    extractor: ActionExtractor,
+) -> ProcessResult:
+    """
+    核心消息处理主流程。
+
+    流程：
+    1. SessionResolver 解析/创建 session
+       - 如果需要新开 session，会先结算上一个未结算的 session
+    2. 消息落盘
+    3. 读取当前 session 的 drafts 和 history
+    4. ActionExtractor 生成增量 Actions
+    5. 逐个执行 Actions
+    6. 返回 ProcessResult（包含结算信息）
+    """
+
+    # 如果前端没有传 message_id，提前生成一个，
+    # 方便结算事件关联到这条触发消息。
+    if not message.message_id:
+        message = message.model_copy(
+            update={
+                "message_id": state_store.new_id("msg")
+            }
+        )
+
+    with get_db() as conn:
+        # ────────────────────────────────────────────
+        # Step 1: 解析 session
+        #
+        # resolve() 现在返回 SessionResolutionResult：
+        #   - session: 当前活跃的 session
+        #   - created: 是否新创建
+        #   - settled_session: 被结算的旧 session（可能为 None）
+        #   - settled_drafts: 被结算的旧 drafts（可能为空）
+        # ────────────────────────────────────────────
+        resolution = resolver.resolve(conn, message)
+
+        session = resolution.session
+
+        # ────────────────────────────────────────────
+        # Step 2: 当前消息落盘
+        # ────────────────────────────────────────────
+        message_id = state_store.upsert_message(
+            conn,
+            message=message,
+            session_id=session.session_id,
+        )
+
+        # ────────────────────────────────────────────
+        # Step 3: 读取当前 session 状态
+        # ────────────────────────────────────────────
+        drafts = state_store.list_drafts(conn, session.session_id)
+        history = state_store.list_recent_messages(
+            conn,
+            session_id=session.session_id,
+            limit=20,
+        )
+
+        # ────────────────────────────────────────────
+        # Step 4: 调用 LLM / Mock extractor
+        # ────────────────────────────────────────────
+        llm_result = extractor.extract(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        clarify_question = llm_result.clarify_question
+
+        # ────────────────────────────────────────────
+        # Step 5: 逐个执行 Actions
+        # ────────────────────────────────────────────
+        for action in llm_result.actions:
+            local_clarify = apply_action(
+                conn,
+                session_id=session.session_id,
+                drafts=drafts,
+                action=action,
+                message_id=message_id,
+            )
+
+            if local_clarify and not clarify_question:
+                clarify_question = local_clarify
+
+            # 如果发生 CREATE，后续 action 需要看到最新 drafts
+            drafts = state_store.list_drafts(conn, session.session_id)
+
+        # ────────────────────────────────────────────
+        # Step 6: 如果 LLM 返回了 clarify_question，写入事件
+        # ────────────────────────────────────────────
+        if llm_result.clarify_question:
+            state_store.append_event(
+                conn,
+                session_id=session.session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=llm_result.clarify_question,
+                reasoning="llm clarify",
+            )
+
+        # ────────────────────────────────────────────
+        # Step 7: 刷新当前 session 活跃时间
+        # ────────────────────────────────────────────
+        state_store.touch_session(conn, session.session_id)
+
+        # ────────────────────────────────────────────
+        # Step 8: 重新读取最新状态
+        # ────────────────────────────────────────────
+        session = state_store.get_session(conn, session.session_id)
+        assert session is not None
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+
+        # ────────────────────────────────────────────
+        # Step 9: 返回 ProcessResult
+        #
+        # 关键变化：
+        # 把 resolution 中的 settled_session / settled_drafts
+        # 透传到 ProcessResult，让前端知道上一个会话的结算结果。
+        # ────────────────────────────────────────────
+        return ProcessResult(
+            session=session,
+            drafts=drafts,
+            actions=llm_result.actions,
+            clarify_question=clarify_question,
+            message_id=message_id,
+            settled_session=resolution.settled_session,
+            settled_drafts=resolution.settled_drafts,
+        )
+```
+
+---
+
+# 三、`src/api.py` 完整替换
+
+```python
+from __future__ import annotations
+
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status as http_status
+
+from . import feedback_store, state_store
+from .config import SESSION_TIMEOUT_MINUTES
+from .db import get_db
+from .llm import ActionExtractor, get_action_extractor
+from .models import (
+    DraftEvent,
+    FeedbackCreate,
+    FeedbackRecord,
+    IncomingMessage,
+    ProcessResult,
+    SessionDetail,
+    SessionResolutionResult,
+    SessionSettleResult,
+    TradeDraft,
+)
+from .service import process_message
+from .session_resolver import DefaultSessionResolver, SessionResolver
+
+
+router = APIRouter(prefix="/api")
+
+
+def get_session_resolver() -> SessionResolver:
+    """
+    这里可以替换成自定义 SessionResolver。
+    """
+    return DefaultSessionResolver()
+
+
+def get_extractor() -> ActionExtractor:
+    return get_action_extractor()
+
+
+# ────────────────────────────────────────────
+# 核心消息处理接口
+# ────────────────────────────────────────────
+
+@router.post("/messages", response_model=ProcessResult)
+def api_process_message(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+    extractor: ActionExtractor = Depends(get_extractor),
+):
+    """
+    核心接口：接收一条新消息，执行增量状态更新。
+
+    返回：
+    - session: 当前活跃会话
+    - drafts: 当前会话下的所有草稿
+    - actions: 本次模型生成的动作
+    - message_id: 本次消息的 ID
+    - settled_session: 如果触发了新 session 并结算了旧 session，返回旧 session
+    - settled_drafts: 如果触发了结算，返回旧 session 下的所有草稿
+    """
+    return process_message(
+        message=payload,
+        resolver=resolver,
+        extractor=extractor,
+    )
+
+
+# ────────────────────────────────────────────
+# SessionResolver 调试接口
+# ────────────────────────────────────────────
+
+@router.post(
+    "/session-resolver/resolve",
+    response_model=SessionResolutionResult,
+)
+def api_resolve_session(
+    payload: IncomingMessage,
+    resolver: SessionResolver = Depends(get_session_resolver),
+):
+    """
+    SessionResolver 调试接口。
+
+    注意：
+    这个接口会真实执行 resolver 逻辑。
+    如果当前消息触发新 session，并且上一个 session 尚未结算，
+    它也会结算上一个 session。
+    """
+    with get_db() as conn:
+        return resolver.resolve(conn, payload)
+
+
+# ────────────────────────────────────────────
+# Session 查询接口
+# ────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}", response_model=SessionDetail)
+def api_get_session(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        drafts = state_store.list_drafts(conn, session_id)
+        messages = state_store.list_recent_messages(
+            conn,
+            session_id=session_id,
+            limit=100,
+        )
+
+        return SessionDetail(
+            session=session,
+            drafts=drafts,
+            messages=messages,
+        )
+
+
+@router.get("/sessions/{session_id}/drafts", response_model=List[TradeDraft])
+def api_get_session_drafts(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        return state_store.list_drafts(conn, session_id)
+
+
+@router.get("/sessions/{session_id}/events", response_model=List[DraftEvent])
+def api_get_session_events(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        return state_store.list_events(conn, session_id)
+
+
+# ────────────────────────────────────────────
+# Session 结算 / 取消接口
+# ────────────────────────────────────────────
+
+@router.post(
+    "/sessions/{session_id}/settle",
+    response_model=SessionSettleResult,
+)
+def api_settle_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    手动结算一个 session。
+
+    结算规则：
+    1. 遍历该 session 下所有 trade_draft；
+    2. 对每个 draft 独立判断 is_complete：
+       - 所有必需字段都有值 → is_complete=true，proposed/confirmed → confirmed
+       - 存在字段缺失 → is_complete=false，缺失字段 slot_status → unknown
+    3. 结算后 session.status → closed
+
+    适用场景：
+    - 前端点击"结束会话"
+    - 业务系统判断本次交易沟通结束
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_MANUAL,
+            reasoning=reason or "manual settle",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+
+
+@router.post(
+    "/sessions/{session_id}/cancel",
+    response_model=SessionSettleResult,
+)
+def api_cancel_session(
+    session_id: str,
+    reason: Optional[str] = None,
+):
+    """
+    用户主动取消一个 session。
+
+    与 /settle 的区别：
+    - /settle 结算后状态为 closed
+    - /cancel 结算后状态为 cancelled
+
+    适用场景：
+    - 用户明确说"不要了"、"取消"、"算了"
+    """
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="session not found",
+            )
+
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_USER_CANCEL,
+            reasoning=reason or "user cancel",
+        )
+
+        return SessionSettleResult(
+            session=settled_session,
+            drafts=settled_drafts,
+        )
+
+
+# ────────────────────────────────────────────
+# Feedback 接口
+# ────────────────────────────────────────────
+
+@router.post(
+    "/feedback",
+    response_model=FeedbackRecord,
+    status_code=http_status.HTTP_201_CREATED,
+)
+def api_create_feedback(payload: FeedbackCreate):
+    """
+    创建一条反馈，落盘到 data/feedback.db。
+    """
+    return feedback_store.create_feedback(payload)
+
+
+@router.get("/feedback", response_model=List[FeedbackRecord])
+def api_list_feedback(
+    session_id: Optional[str] = None,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    查询反馈列表。
+    """
+    return feedback_store.list_feedback(
+        session_id=session_id,
+        draft_id=draft_id,
+        message_id=message_id,
+        status=status_filter,
+        limit=limit,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/feedback",
+    response_model=List[FeedbackRecord],
+)
+def api_get_session_feedback(
+    session_id: str,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    查询某个 session 下的反馈。
+    """
+    return feedback_store.list_feedback(
+        session_id=session_id,
+        draft_id=draft_id,
+        message_id=message_id,
+        status=status_filter,
+        limit=limit,
+    )
+
+
+# ────────────────────────────────────────────
+# 维护接口（调试用）
+# ────────────────────────────────────────────
+
+@router.post("/maintenance/run")
+def api_run_maintenance():
+    """
+    手动触发一次维护任务（调试用）。
+
+    生产环境由后台轮询自动执行。
+    """
+    from .maintenance import run_maintenance_sync
+
+    result = run_maintenance_sync()
+
+    return {
+        "status": "ok",
+        "marked_expired": result["marked_expired"],
+        "settled": result["settled"],
+    }
+```
+
+---
+
+# 四、关键变化对照表
+
+## 4.1 `service.py` 中 `process_message` 的变化
+
+| 步骤 | 旧代码 | 新代码 | 原因 |
+|---|---|---|---|
+| 解析 session | `session = resolver.resolve(conn, message)` | `resolution = resolver.resolve(conn, message)` → `session = resolution.session` | `resolve()` 返回类型从 `Session` 变为 `SessionResolutionResult` |
+| 返回结果 | `ProcessResult(session, drafts, actions, clarify, message_id)` | 新增 `settled_session=resolution.settled_session`, `settled_drafts=resolution.settled_drafts` | 前端需要知道旧会话的结算结果 |
+
+## 4.2 `api.py` 中 `api_process_message` 的变化
+
+| 项目 | 旧 | 新 |
+|---|---|---|
+| 返回模型 | `ProcessResult`（5 个字段） | `ProcessResult`（7 个字段，新增 `settled_session` / `settled_drafts`） |
+| 函数签名 | 不变 | 不变 |
+| 内部逻辑 | 不变 | 不变（透传 `process_message` 返回值） |
+
+## 4.3 `api.py` 中 `api_resolve_session` 的变化
+
+| 项目 | 旧 | 新 |
+|---|---|---|
+| 返回模型 | `SessionResolveResult` | `SessionResolutionResult` |
+| 内部逻辑 | 手动查找 + 判断 | 直接调用 `resolver.resolve()` |
+
+## 4.4 不需要改的函数
+
+| 函数 | 原因 |
+|---|---|
+| `apply_action()` | 只处理 `Action`，与结算无关 |
+| `resolve_target()` | 只处理 `TradeDraft` 定位，与结算无关 |
+| `_get_lookup_target()` | 只处理 `ActionTarget` 合并，与结算无关 |
+
+---
+
+# 五、`service.py` 中需要更新的 import
+
+确保 `service.py` 顶部的 import 包含：
+
+```python
+from .models import (
+    Action,
+    ActionTarget,
+    ActionType,
+    IncomingMessage,
+    ProcessResult,
+    TradeDraft,
+)
+from .session_resolver import SessionResolver
+```
+
+注意：`SessionResolutionResult` 不需要在 `service.py` 中显式 import，因为 `resolver.resolve()` 的返回值直接通过 `resolution` 变量使用，Python 的类型推断会自动处理。但如果你使用类型检查工具（如 mypy），可以显式 import：
+
+```python
+from .models import SessionResolutionResult
+```
+
+---
+
+# 六、完整调用链路（更新后）
+
+```text
+POST /api/messages
+    |
+    v
+api_process_message()                    [src/api.py]
+    |
+    v
+process_message()                        [src/service.py]
+    |
+    ├── resolver.resolve()               [src/session_resolver.py]
+    |       |
+    |       ├── mark_expired_sessions()  [src/state_store.py]  ← 标记过期
+    |       ├── find_active_session()    [src/state_store.py]  ← 查找活跃
+    |       ├── settle_expired_sessions  [src/state_store.py]  ← 结算旧会话
+    |       |       |
+    |       |       └── settle_draft()   [src/state_store.py]  ← 逐个 draft 结算
+    |       |               |
+    |       |               └── 设置 is_complete (在 draft 级别)
+    |       |
+    |       └── create_session()         [src/state_store.py]  ← 创建新会话
+    |
+    |   返回 SessionResolutionResult
+    |       ├── session
+    |       ├── settled_session          ← 可能为 None
+    |       └── settled_drafts           ← 可能为空列表
+    |
+    ├── upsert_message()                 [src/state_store.py]
+    ├── list_drafts()                    [src/state_store.py]
+    ├── list_recent_messages()           [src/state_store.py]
+    ├── extractor.extract()              [src/llm.py]
+    │       |
+    │       └── 返回 LLMActionsResponse
+    │
+    ├── apply_action() × N               [src/service.py]
+    |       |
+    |       ├── create_draft()           [src/state_store.py]
+    |       ├── update_draft_fields()    [src/state_store.py]
+    |       ├── set_draft_status()       [src/state_store.py]
+    |       └── append_event()           [src/state_store.py]
+    |
+    ├── touch_session()                  [src/state_store.py]
+    │
+    └── 返回 ProcessResult
+            ├── session
+            ├── drafts
+            ├── actions
+            ├── clarify_question
+            ├── message_id
+            ├── settled_session          ← 新增
+            └── settled_drafts           ← 新增
+```
+
+---
+
+# 七、前端收到的响应示例
+
+## 7.1 正常消息（无结算触发）
+
+```json
+{
+  "session": {
+    "session_id": "session_001",
+    "status": "active"
+  },
+  "drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "amount": 2000,
+      "is_complete": null
+    }
+  ],
+  "actions": [],
+  "clarify_question": null,
+  "message_id": "msg_001",
+  "settled_session": null,
+  "settled_drafts": []
+}
+```
+
+## 7.2 触发新 session 并结算旧 session
+
+```json
+{
+  "session": {
+    "session_id": "session_002",
+    "status": "active"
+  },
+  "drafts": [],
+  "actions": [],
+  "clarify_question": null,
+  "message_id": "msg_050",
+  "settled_session": {
+    "session_id": "session_001",
+    "status": "closed",
+    "close_reason": "new_session",
+    "settled_at": "2026-06-22T11:00:00Z"
+  },
+  "settled_drafts": [
+    {
+      "draft_id": "draft_1",
+      "asset_name": "24长发",
+      "amount": 2000,
+      "price": 100.85,
+      "is_complete": true,
+      "slots": {
+        "asset_name": { "value": "24长发", "status": "confirmed" },
+        "amount": { "value": 2000, "status": "confirmed" },
+        "price": { "value": 100.85, "status": "confirmed" }
+      }
+    },
+    {
+      "draft_id": "draft_2",
+      "asset_name": "25诚通",
+      "amount": 1000,
+      "price": null,
+      "is_complete": false,
+      "slots": {
+        "asset_name": { "value": "25诚通", "status": "confirmed" },
+        "amount": { "value": 1000, "status": "confirmed" },
+        "price": { "value": null, "status": "unknown" },
+        "asset_code": { "value": null, "status": "unknown" }
+      }
+    }
+  ]
+}
+```
+
+前端拿到 `settled_session` 不为 `null`，就知道：
+
+1. 上一个会话已经结算；
+2. 可以直接渲染 `settled_drafts`；
+3. 每个 draft 的 `is_complete` 告诉前端这笔交易是否完整。
+
+---
+
+# 八、总结
+
+这次补齐的核心改动：
+
+| 文件 | 改动 |
+|---|---|
+| `src/service.py` → `process_message()` | 适配 `SessionResolutionResult`，透传 `settled_session` / `settled_drafts` 到 `ProcessResult` |
+| `src/api.py` → `api_process_message()` | 返回模型自动适配（`ProcessResult` 已更新） |
+| `src/api.py` → `api_resolve_session()` | 返回模型从 `SessionResolveResult` 改为 `SessionResolutionResult` |
+| `src/api.py` → 新增 `/settle`、`/cancel`、`/maintenance/run` | 手动结算、用户取消、调试维护 |
+
+`apply_action()` 和 `resolve_target()` **不需要改**，它们只负责处理增量 `Action`，与结算逻辑完全解耦。
+
