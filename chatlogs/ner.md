@@ -14350,3 +14350,616 @@ def find_latest_session(conn):
 
 **`find_latest_session` 必须用 `conversation_key` 过滤，否则会跨通道误匹配。**
 
+
+---
+🙋**user**:
+---
+```
+很好，经过仔细研读, 我看明白了整个设计的关键。基本就是构造合适的prompt，让AI输出LLMActionResponse即一系列Actions, 然后最核心的事务处理，是在
+create_draft
+update_draft_fields
+set_draft_status
+settle_draft
+这四个函数上。其他关于session的create/settle/find之类的，本质还是会回到对其下属的drafts的事务处理。
+create_draft我认为你写的没问题。它的使用场景应该是action_type=CREATE, AI产出updates之后，将其中内容构建成一个draft并入表。
+settle_draft我觉得你写的稍有问题。即使存在缺失字段，缺失字段值设None然后status设unknown后，也应该对剩下的有值字段作status设confirmed处理。其他我觉得问题不大。
+set_draft_status我认为你写的好像有问题。它的使用场景应该是action_type=CONFIRM/REJECT/CANCEL，即AI产出action之后，若action是其三之一，那么直接将对应draft的status作对应改变。本质就是改变draft的status。但是你似乎忘记了将该draft下的slots里各fields的状态也作改变吧？我觉得有必要，因为reject/cancel一个draft后，其slots内部的字段status设为ambiguous甚至rejected会不会更好？而confirm一个draft后，其slots内部的字段status全改为confirmed似乎也可以（但这里因为在settle时有兜底更改confirmed，所以不改也可以）。
+update_draft_fields是我唯一没看太懂的。按你在apply_action这个函数所写，ActionType.CREATE操作时，先判断draft是否存在，如果存在就改成用 update_draft_fields. 所以这是一种预防AI输出错误actiontype的兜底操作吗？然后你在update_draft_fields内部写了针对ActionType=CONFIRM时的处理，但实际在apply_action内部，真的处理CONFIRM时，你又不调用update_draft_fields了，转而调用set_draft_status直接确认draft的状态。我不是很清楚这部分。
+```
+
+---
+🤖**assistant**:
+---
+
+你的分析非常准确。我逐一回应并给出修正后的代码。
+
+---
+
+# 一、四个核心函数的职责重新定义
+
+先明确每个函数**只做什么**，避免职责混淆：
+
+| 函数 | 职责 | 触发场景 |
+|---|---|---|
+| `create_draft` | 创建新草稿，写入初始字段 | `action_type=CREATE`，draft 不存在 |
+| `update_draft_fields` | **只改字段值**，对应 slot 设为 `proposed` | `action_type=UPDATE`；`CREATE` 时 draft 已存在（兜底） |
+| `set_draft_status` | **改 draft 整体状态**，联动改所有有值字段的 slot 状态 | `action_type=CONFIRM/REJECT/CANCEL` |
+| `settle_draft` | 结算兜底：有值字段确认，缺失字段标 `unknown` | 会话结算时 |
+
+---
+
+# 二、`settle_draft` 修正
+
+你说得对。当前代码的问题是：字段欠缺时，只把缺失字段标了 `unknown`，但**有值字段没有从 `proposed` 改为 `confirmed`**。
+
+修正后的规则统一为：
+
+```text
+对每个必需字段：
+  如果缺失 → value=None, status=unknown
+  如果有值：
+    原状态是 proposed 或 confirmed → 改为 confirmed
+    原状态是 rejected / ambiguous / unknown → 不动
+```
+
+## 修正代码
+
+```python
+def settle_draft(
+    conn,
+    draft_id: str,
+    message_id: Optional[str] = None,
+    reasoning: Optional[str] = None,
+) -> Optional[TradeDraft]:
+    """
+    结算单个 trade_draft。
+
+    规则：
+    1. 检查 REQUIRED_SETTLE_FIELDS 是否都有值；
+    2. 缺失字段 → value=None, status=unknown；
+    3. 有值字段 → 原状态为 proposed/confirmed 的，统一改为 confirmed；
+       原状态为 rejected/ambiguous/unknown 的，不动；
+    4. is_complete = 没有缺失字段。
+    """
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    slots = json.loads(row["slots_json"] or "{}")
+    now = utcnow()
+
+    # ────────────────────────────────────────────
+    # Step 1: 检查哪些字段缺失
+    # ────────────────────────────────────────────
+    missing_fields = []
+
+    for field in REQUIRED_SETTLE_FIELDS:
+        value = row[field]
+        if _is_missing_value(value):
+            missing_fields.append(field)
+
+    is_complete = len(missing_fields) == 0
+
+    # ────────────────────────────────────────────
+    # Step 2: 缺失字段 → value=None, status=unknown
+    # ────────────────────────────────────────────
+    for field in missing_fields:
+        slots[field] = SlotState(
+            value=None,
+            status="unknown",
+            source_message_id=message_id,
+            updated_at=now,
+        ).model_dump(mode="json")
+
+    # ────────────────────────────────────────────
+    # Step 3: 有值字段 → proposed/confirmed 改为 confirmed
+    #         rejected/ambiguous/unknown 不动
+    # ────────────────────────────────────────────
+    for field in REQUIRED_SETTLE_FIELDS:
+        if field in missing_fields:
+            continue  # 已经在上面处理了
+
+        # 确保该字段在 slots 中有记录
+        if field not in slots:
+            slots[field] = SlotState(
+                value=row[field],
+                status="confirmed",
+                source_message_id=message_id,
+                updated_at=now,
+            ).model_dump(mode="json")
+        else:
+            old_status = slots[field].get("status", "")
+
+            if old_status in {"proposed", "confirmed"}:
+                slots[field]["status"] = "confirmed"
+                slots[field]["updated_at"] = now.isoformat()
+            # rejected / ambiguous / unknown → 不动
+
+    # ────────────────────────────────────────────
+    # Step 4: 写回数据库
+    # ────────────────────────────────────────────
+    conn.execute(
+        """
+        UPDATE trade_drafts
+        SET slots_json = ?,
+            is_complete = ?,
+            updated_at = ?
+        WHERE draft_id = ?
+        """,
+        (
+            json.dumps(slots, ensure_ascii=False),
+            1 if is_complete else 0,
+            iso(now),
+            draft_id,
+        ),
+    )
+
+    # ────────────────────────────────────────────
+    # Step 5: 写入结算事件
+    # ────────────────────────────────────────────
+    append_event(
+        conn,
+        session_id=row["session_id"],
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type="SETTLE",
+        field=None,
+        old_value=None,
+        new_value={
+            "is_complete": is_complete,
+            "missing_fields": missing_fields,
+        },
+        reasoning=reasoning,
+    )
+
+    return get_draft(conn, draft_id)
+```
+
+---
+
+# 三、`set_draft_status` 修正
+
+你说得对。当前代码只改了 `draft.status`，**没有联动改内部字段的 `slot_status`**。
+
+修正后的规则：
+
+| 动作 | `draft.status` | 有值字段的 `slot_status` | 缺失/`unknown` 字段 |
+|---|---|---|---|
+| `CONFIRM` | `confirmed` | `proposed` / `confirmed` → `confirmed` | 不动 |
+| `REJECT` | `rejected` | `proposed` / `confirmed` → `rejected` | 不动 |
+| `CANCEL` | `cancelled` | `proposed` / `confirmed` → `cancelled` | 不动 |
+
+## 修正代码
+
+```python
+def set_draft_status(
+    conn,
+    draft_id: str,
+    status: str,
+    message_id: Optional[str],
+    action_type: ActionType | str,
+    reasoning: Optional[str] = None,
+) -> None:
+    """
+    改变 draft 的整体状态，并联动修改内部字段的 slot 状态。
+
+    规则：
+    - CONFIRM:
+        draft.status → confirmed
+        有值字段的 proposed/confirmed → confirmed
+        unknown/ambiguous → 不动
+    - REJECT:
+        draft.status → rejected
+        有值字段的 proposed/confirmed → rejected
+        unknown/ambiguous → 不动
+    - CANCEL:
+        draft.status → cancelled
+        有值字段的 proposed/confirmed → cancelled
+        unknown/ambiguous → 不动
+    """
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return
+
+    old_status = row["status"]
+
+    if old_status == status:
+        return
+
+    now = utcnow()
+
+    # ────────────────────────────────────────────
+    # Step 1: 更新 draft.status
+    # ────────────────────────────────────────────
+    conn.execute(
+        """
+        UPDATE trade_drafts
+        SET status = ?, updated_at = ?
+        WHERE draft_id = ?
+        """,
+        (status, iso(now), draft_id),
+    )
+
+    # ────────────────────────────────────────────
+    # Step 2: 联动修改内部字段的 slot 状态
+    # ────────────────────────────────────────────
+    slots = json.loads(row["slots_json"] or "{}")
+
+    # 决定字段状态映射
+    # proposed/confirmed → 目标状态
+    # rejected/ambiguous/unknown → 不动
+    if status == "confirmed":
+        target_slot_status = "confirmed"
+    elif status == "rejected":
+        target_slot_status = "rejected"
+    elif status == "cancelled":
+        target_slot_status = "cancelled"
+    else:
+        target_slot_status = None
+
+    if target_slot_status:
+        for field, slot in slots.items():
+            old_slot_status = slot.get("status", "")
+
+            if old_slot_status in {"proposed", "confirmed"}:
+                slot["status"] = target_slot_status
+                slot["updated_at"] = now.isoformat()
+            # unknown / ambiguous / rejected → 不动
+
+        conn.execute(
+            """
+            UPDATE trade_drafts
+            SET slots_json = ?
+            WHERE draft_id = ?
+            """,
+            (
+                json.dumps(slots, ensure_ascii=False),
+                draft_id,
+            ),
+        )
+
+    # ────────────────────────────────────────────
+    # Step 3: 写入事件
+    # ────────────────────────────────────────────
+    action_name = (
+        action_type.value
+        if isinstance(action_type, ActionType)
+        else str(action_type)
+    )
+
+    append_event(
+        conn,
+        session_id=row["session_id"],
+        draft_id=draft_id,
+        message_id=message_id,
+        action_type=action_name,
+        field="status",
+        old_value=old_status,
+        new_value=status,
+        reasoning=reasoning,
+    )
+```
+
+---
+
+# 四、`update_draft_fields` 修正
+
+你的困惑完全合理。当前代码有两个问题：
+
+1. **`action_type` 参数是多余的**：`CONFIRM` 不走这个函数，所以内部针对 `CONFIRM` 的 `slot_status` 分支是死代码；
+2. **职责不清晰**：这个函数应该**只改字段值**，更新后对应字段状态一律设为 `proposed`。
+
+## 修正代码
+
+```python
+def update_draft_fields(
+    conn,
+    draft_id: str,
+    updates: Dict[str, Any],
+    message_id: Optional[str],
+    reasoning: Optional[str] = None,
+) -> List[str]:
+    """
+    更新 draft 的具体字段值。
+
+    职责：
+    - 只改字段值（amount, price, asset_name 等）
+    - 更新后对应字段的 slot 状态一律设为 proposed
+    - 不涉及 draft 整体状态的改变（那是 set_draft_status 的事）
+
+    调用场景：
+    - action_type=UPDATE
+    - action_type=CREATE 但 draft 已存在（兜底，避免重复创建）
+    """
+    row = conn.execute(
+        "SELECT * FROM trade_drafts WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()
+
+    if not row:
+        return []
+
+    updates = normalize_updates(updates)
+    slots = json.loads(row["slots_json"] or "{}")
+    now = utcnow()
+
+    changed_fields: List[str] = []
+
+    for field, value in updates.items():
+        if field not in ALLOWED_DRAFT_FIELDS:
+            continue
+
+        if value is None:
+            continue
+
+        old_value = row[field]
+
+        if old_value == value:
+            continue
+
+        # 更新字段值
+        conn.execute(
+            f"""
+            UPDATE trade_drafts
+            SET {field} = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (value, iso(now), draft_id),
+        )
+
+        # 对应字段的 slot 状态设为 proposed
+        # 因为只是"提出"了新值，还没被确认
+        slots[field] = SlotState(
+            value=value,
+            status="proposed",
+            source_message_id=message_id,
+            updated_at=now,
+        ).model_dump(mode="json")
+
+        # 写入事件
+        append_event(
+            conn,
+            session_id=row["session_id"],
+            draft_id=draft_id,
+            message_id=message_id,
+            action_type="UPDATE",
+            field=field,
+            old_value=old_value,
+            new_value=value,
+            reasoning=reasoning,
+        )
+
+        changed_fields.append(field)
+
+    if changed_fields:
+        conn.execute(
+            """
+            UPDATE trade_drafts
+            SET slots_json = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (
+                json.dumps(slots, ensure_ascii=False),
+                iso(now),
+                draft_id,
+            ),
+        )
+
+    return changed_fields
+```
+
+---
+
+# 五、`apply_action` 中的调用关系修正
+
+现在四个函数的职责清晰了，`apply_action` 中的调用关系也一目了然：
+
+```python
+def apply_action(conn, *, session_id, drafts, action, message_id):
+    lookup_target = _get_lookup_target(action)
+
+    # ────────────────────────────────────────────
+    # CREATE
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.CREATE:
+        updates = dict(action.updates or {})
+
+        if lookup_target.asset_name and not updates.get("asset_name"):
+            updates["asset_name"] = lookup_target.asset_name
+        if lookup_target.asset_code and not updates.get("asset_code"):
+            updates["asset_code"] = lookup_target.asset_code
+
+        existing = resolve_target(drafts, lookup_target)
+
+        if existing:
+            # 兜底：AI 把已存在的标的又输出了 CREATE
+            # 不重复创建，改为更新已有字段
+            update_draft_fields(
+                conn,
+                draft_id=existing.draft_id,
+                updates=updates,
+                message_id=message_id,
+                reasoning=action.reasoning,
+            )
+        else:
+            # 正常创建
+            create_draft(
+                conn,
+                session_id=session_id,
+                updates=updates,
+                message_id=message_id,
+            )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # UPDATE → 只改字段值，字段状态设 proposed
+    # ────────────────────────────────────────────
+    if action.action_type == ActionType.UPDATE:
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            # ... clarify 逻辑 ...
+            return clarify
+
+        if target_draft.status == "confirmed":
+            # 已确认的不允许直接修改
+            # ... NOOP 逻辑 ...
+            return None
+
+        update_draft_fields(
+            conn,
+            draft_id=target_draft.draft_id,
+            updates=action.updates,
+            message_id=message_id,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # CONFIRM / REJECT / CANCEL
+    # → 改 draft 整体状态 + 联动改字段状态
+    # ────────────────────────────────────────────
+    if action.action_type in (
+        ActionType.CONFIRM,
+        ActionType.REJECT,
+        ActionType.CANCEL,
+    ):
+        target_draft = resolve_target(drafts, lookup_target)
+
+        if not target_draft and len(drafts) == 1:
+            target_draft = drafts[0]
+
+        if not target_draft:
+            # ... clarify 逻辑 ...
+            return clarify
+
+        status_map = {
+            ActionType.CONFIRM: "confirmed",
+            ActionType.REJECT: "rejected",
+            ActionType.CANCEL: "cancelled",
+        }
+
+        set_draft_status(
+            conn,
+            draft_id=target_draft.draft_id,
+            status=status_map[action.action_type],
+            message_id=message_id,
+            action_type=action.action_type,
+            reasoning=action.reasoning,
+        )
+
+        return None
+
+    # ────────────────────────────────────────────
+    # CLARIFY / NOOP → 只写事件，不改状态
+    # ────────────────────────────────────────────
+    # ... 与之前一致，省略 ...
+```
+
+---
+
+# 六、关于你的两个具体疑问
+
+## 6.1 "CREATE 时先判断 draft 是否存在，存在就改成 `update_draft_fields`，这是兜底吗？"
+
+**是的。** 这是一个防御性设计。
+
+LLM 可能会输出这样的错误：
+
+```text
+对话中已经创建了 "24长发" 的 draft，
+但 LLM 又输出了一个 CREATE "24长发" 的 action。
+```
+
+如果不做兜底，就会创建两个重复的 `draft`。所以：
+
+```text
+CREATE + draft 已存在 → 降级为 update_draft_fields
+CREATE + draft 不存在 → 正常 create_draft
+```
+
+## 6.2 "`update_draft_fields` 内部有 `CONFIRM` 分支，但 `CONFIRM` 不走这个函数？"
+
+**你说得对，那是死代码。** 修正后已经彻底去掉了 `action_type` 参数。
+
+现在 `update_draft_fields` 的逻辑非常简单：
+
+```text
+改字段值 → 对应字段状态设 proposed → 写事件 → 完事
+```
+
+`CONFIRM` 的处理完全交给 `set_draft_status`，不再有任何交叉。
+
+---
+
+# 七、四个函数的最终职责对照
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  create_draft                                                   │
+│  职责：创建新草稿，写入初始字段，字段状态设 proposed             │
+│  触发：action_type=CREATE，draft 不存在                         │
+│  不涉及：已有草稿的修改                                         │
+├─────────────────────────────────────────────────────────────────┤
+│  update_draft_fields                                            │
+│  职责：只改字段值，对应字段状态设 proposed                       │
+│  触发：action_type=UPDATE；CREATE 兜底（draft 已存在）          │
+│  不涉及：draft 整体状态、字段确认/拒绝                          │
+├─────────────────────────────────────────────────────────────────┤
+│  set_draft_status                                               │
+│  职责：改 draft 整体状态，联动改所有有值字段的状态               │
+│  触发：action_type=CONFIRM / REJECT / CANCEL                    │
+│  不涉及：字段值的修改                                           │
+├─────────────────────────────────────────────────────────────────┤
+│  settle_draft                                                   │
+│  职责：结算兜底，有值字段确认，缺失字段标 unknown                │
+│  触发：会话结算（新消息触发 / 轮询触发 / 手动触发）             │
+│  不涉及：字段值的修改                                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 八、字段状态流转全景
+
+```text
+                    用户提出新值
+                         │
+                         ▼
+                    ┌──────────┐
+                    │ proposed │ ← update_draft_fields
+                    └────┬─────┘
+                         │
+          ┌──────────────┼──────────────┐
+          │              │              │
+    set_draft_status  set_draft_status  settle_draft
+    (CONFIRM)         (REJECT/CANCEL)   (会话结算)
+          │              │              │
+          ▼              ▼              ▼
+    ┌───────────┐  ┌──────────┐  ┌───────────┐
+    │ confirmed │  │ rejected │  │ confirmed │
+    └───────────┘  │ cancelled│  └───────────┘
+                   └──────────┘
+                         │
+                    settle_draft
+                    (字段缺失)
+                         │
+                         ▼
+                   ┌───────────┐
+                   │  unknown  │
+                   └───────────┘
+```
+
