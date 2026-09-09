@@ -14963,3 +14963,322 @@ CREATE + draft 不存在 → 正常 create_draft
                    └───────────┘
 ```
 
+
+---
+🙋**user**:
+---
+```
+关于提示词工程，我给需要NER的字段写了很多规则，介绍了ner它们相应的特征和方法。我有两个问题想问：
+1. 是否加few-shot example呢？如果加，几个比较好
+2. 这些规则prompt，是放在system prompt里，还是放在user prompt里呢？
+```
+
+---
+🤖**assistant**:
+---
+
+这两个问题都很关键，直接影响模型的抽取质量和稳定性。我结合你的具体场景（多轮 DST + 结构化 Actions 输出）来回答。
+
+---
+
+# 一、是否加 Few-shot？加几个？
+
+## 1.1 结论：必须加，建议 3~5 个
+
+你的任务有几个特征决定了 few-shot 几乎是必须的：
+
+| 特征 | 为什么需要 few-shot |
+|---|---|
+| 输出是复杂嵌套 JSON | 光靠 Schema 描述，模型容易漏字段、多字段、格式错 |
+| 有多种 `action_type` | 模型需要看到每种类型的"长什么样" |
+| 有指代消解 | "前者""后者""这笔"的处理方式，纯规则很难说清，一个例子胜过十句话 |
+| 增量更新而非全量输出 | 模型天然倾向于输出完整状态，需要例子告诉它"只输出变化的部分" |
+| 有 `CLARIFY` 兜底 | 什么时候该反问而不是硬猜，需要例子示范边界 |
+
+## 1.2 建议数量：3~5 个
+
+**不建议超过 5 个**，原因：
+
+1. **Token 成本**：你的 prompt 里已经有规则 + 当前状态 + 历史消息，再加太多例子会挤占上下文窗口
+2. **边际收益递减**：3~5 个覆盖主要场景后，再加的例子对模型帮助很小
+3. **过拟合风险**：例子太多，模型可能"照抄"例子中的模式，而不是真正理解规则
+
+## 1.3 这 3~5 个例子应该覆盖什么
+
+建议按**场景覆盖度**选择，而不是按数量堆：
+
+| 序号 | 覆盖场景 | 为什么必须 |
+|---|---|---|
+| 例1 | **简单字段更新**（如更新价格） | 最基本的 `UPDATE`，让模型知道输出格式 |
+| 例2 | **指代消解**（如"前者量加到2000"） | 你的核心难点，必须示范 |
+| 例3 | **创建新草稿**（如"另外再看一笔25诚通"） | 让模型知道 `CREATE` 怎么输出 |
+| 例4 | **确认/拒绝**（如"这笔可以，那笔不要了"） | 让模型知道 `CONFIRM` / `REJECT` 怎么输出 |
+| 例5（可选） | **信息不足需要反问**（如"量改一下"但没说哪笔改多少） | 让模型知道什么时候该输出 `CLARIFY` 而不是硬猜 |
+
+## 1.4 Few-shot 的写法建议
+
+**每个例子要包含完整的输入→输出对**，而不是只给输出。
+
+```text
+【示例1】
+当前草稿状态：
+[{"draft_id":"draft_1","asset_name":"24长发","price":100.85,"amount":null}]
+
+近期对话：
+- A: 24长发有量吗？
+- B: 100.85 有
+
+最新消息：
+- A: 量加到2000
+
+输出：
+{"actions":[{"action_type":"UPDATE","target":{"draft_id":"draft_1"},"updates":{"amount":2000},"confidence":0.9,"reasoning":"用户要求将24长发的量加到2000"}],"clarify_question":null}
+```
+
+**关键原则**：
+
+1. **例子中的字段名、格式必须和你要求的 Output Schema 完全一致**
+2. **例子中的 `draft_id` 要用真实格式的占位符**（如 `draft_1`），不要用 `draft_xxx`
+3. **例子中要展示 `reasoning` 字段的写法**，否则模型可能不知道怎么写
+4. **例子中 `clarify_question` 大多数时候是 `null`**，只在需要反问的例子中才非空
+
+## 1.5 Few-shot 放在哪里
+
+这就引出你的第二个问题。
+
+---
+
+# 二、规则放 System Prompt 还是 User Prompt？
+
+## 2.1 结论：分层放，不是二选一
+
+```text
+System Prompt：角色 + 核心规则 + 输出格式约束
+User Prompt：  当前状态 + 历史 + 最新消息 + few-shot（如果放这里的话）
+```
+
+## 2.2 具体分层建议
+
+### System Prompt 放什么
+
+```text
+1. 角色定义（"你是一个交易对话状态追踪助手"）
+2. 核心任务描述（"分析最新消息，输出增量操作指令"）
+3. 字段抽取规则（你写的那些NER规则）
+4. 输出格式约束（"严格输出JSON，不要输出解释"）
+5. 全局约束（"不要编造数字"、"不要输出完整状态"）
+```
+
+**为什么放 System？**
+
+- 这些内容在每次请求中**不变**
+- Qwen 对 System Prompt 有较好的遵循度
+- 把规则放 System 可以让 User Prompt 更干净，只放变化的数据
+
+### User Prompt 放什么
+
+```text
+1. 当前草稿状态（current_drafts）
+2. 近期对话历史（recent_history）
+3. 最新消息（latest_message）
+4. Few-shot 示例（如果选择放在 User 中）
+```
+
+**为什么放 User？**
+
+- 这些内容**每次请求都不同**
+- 放在 User 中，模型能更好地将注意力集中在"当前要处理的数据"上
+
+## 2.3 Few-shot 放 System 还是 User？
+
+两种方案都可以，但有区别：
+
+### 方案 A：Few-shot 放 System Prompt 末尾
+
+```text
+System Prompt:
+  角色定义
+  规则
+  输出格式
+  示例1
+  示例2
+  示例3
+
+User Prompt:
+  当前状态
+  历史
+  最新消息
+```
+
+**优点**：
+- System Prompt 一次性定义好，每次请求只改 User
+- 结构清晰
+
+**缺点**：
+- System Prompt 会变得很长
+- 如果规则本身就很长，再加例子可能超出模型对 System Prompt 的有效注意力范围
+
+### 方案 B：Few-shot 作为多轮对话放在 User/Assistant 交替中（推荐）
+
+```text
+System Prompt:
+  角色定义
+  规则
+  输出格式
+
+User:   [示例1的输入]
+Assistant: [示例1的输出]
+User:   [示例2的输入]
+Assistant: [示例2的输出]
+User:   [示例3的输入]
+Assistant: [示例3的输出]
+User:   [当前真实输入]
+```
+
+**优点**：
+- 模型对多轮对话格式的 few-shot 遵循度最高
+- 每个例子的输入输出边界非常清晰
+- 不会让 System Prompt 过长
+
+**缺点**：
+- 构造 messages 数组时稍复杂
+- 每次请求都要带上这些例子（但这在方案 A 中也是一样的）
+
+### 我的建议
+
+**对于 Qwen 模型，推荐方案 B。**
+
+原因：
+
+1. Qwen 在 SFT 阶段大量使用了多轮对话格式，对 `User/Assistant` 交替的 few-shot 遵循度最好
+2. 你的输出是严格 JSON，多轮格式能让模型更清楚地看到"输入→输出"的对应关系
+3. 避免 System Prompt 过长导致模型对后面的规则注意力下降
+
+## 2.4 代码层面的实现
+
+如果你选择方案 B，`call_qwen_api` 中的 `messages` 数组应该这样构造：
+
+```python
+def call_qwen_api(prompt_messages: list[dict]) -> str:
+    """
+    prompt_messages 已经包含了：
+    - system（角色+规则）
+    - few-shot 的 user/assistant 交替
+    - 当前真实输入的 user
+    """
+    payload = {
+        "model": config.QWEN_MODEL,
+        "temperature": 0,
+        "messages": prompt_messages,
+    }
+    # ... 调用 API ...
+```
+
+构造 `prompt_messages` 的函数：
+
+```python
+def build_messages(
+    *,
+    session: Session,
+    drafts: List[TradeDraft],
+    history: List[MessageRecord],
+    message: IncomingMessage,
+) -> list[dict]:
+    messages = []
+
+    # ────────────────────────────────────────
+    # 1. System Prompt：角色 + 规则 + 输出格式
+    # ────────────────────────────────────────
+    system_prompt = build_system_prompt()
+    messages.append({
+        "role": "system",
+        "content": system_prompt,
+    })
+
+    # ────────────────────────────────────────
+    # 2. Few-shot 示例（多轮对话格式）
+    # ────────────────────────────────────────
+    for example in FEW_SHOT_EXAMPLES:
+        messages.append({
+            "role": "user",
+            "content": example["input"],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": example["output"],
+        })
+
+    # ────────────────────────────────────────
+    # 3. 当前真实输入
+    # ────────────────────────────────────────
+    current_input = build_current_input(
+        session=session,
+        drafts=drafts,
+        history=history,
+        message=message,
+    )
+    messages.append({
+        "role": "user",
+        "content": current_input,
+    })
+
+    return messages
+```
+
+## 2.5 System Prompt 的结构建议
+
+```text
+# Role
+你是一个银行间市场交易对话状态追踪助手。
+
+# Task
+分析最新消息，结合当前草稿状态和历史对话，输出增量操作指令。
+
+# 字段抽取规则
+（你写的那些NER规则，按字段分块）
+
+## asset_name 抽取规则
+...
+
+## amount 抽取规则
+...
+
+## price 抽取规则
+...
+
+# 动作类型说明
+- CREATE: ...
+- UPDATE: ...
+- CONFIRM: ...
+- REJECT: ...
+- CANCEL: ...
+- CLARIFY: ...
+- NOOP: ...
+
+# 输出格式
+严格输出 JSON，不要输出解释文本，不要输出 markdown。
+（Output Schema）
+
+# 全局约束
+1. 只输出增量操作，不要输出完整状态
+2. 不要编造数字
+3. 无法定位时输出 CLARIFY
+4. 不要输出 ```json 包裹
+```
+
+**注意**：把**输出格式约束**和**全局约束**放在 System Prompt 的**最后**。因为模型有"近因效应"（recency bias），最后看到的指令遵循度最高。
+
+---
+
+# 三、总结
+
+| 问题 | 结论 |
+|---|---|
+| 是否加 few-shot | **必须加** |
+| 加几个 | **3~5 个**，覆盖主要场景 |
+| 例子覆盖什么 | 简单更新、指代消解、创建、确认/拒绝、反问（可选） |
+| 规则放哪里 | **System Prompt**（角色+规则+输出格式） |
+| 当前数据放哪里 | **User Prompt**（状态+历史+最新消息） |
+| Few-shot 放哪里 | **推荐多轮对话格式**（User/Assistant 交替），放在 System 之后、真实输入之前 |
+| System Prompt 中什么放最后 | **输出格式约束 + 全局约束**（利用近因效应） |
+
