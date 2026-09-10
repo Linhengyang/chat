@@ -15282,3 +15282,1112 @@ def build_messages(
 | Few-shot 放哪里 | **推荐多轮对话格式**（User/Assistant 交替），放在 System 之后、真实输入之前 |
 | System Prompt 中什么放最后 | **输出格式约束 + 全局约束**（利用近因效应） |
 
+
+---
+🙋**user**:
+---
+```
+有一条主脉络之一希望你帮我判断下：
+message_id，通过获取session输入llm得到actions，然后在执行这些actions的过程中，不少draft发生了新建、更新、确认、拒绝、取消、NOOP等等动作。
+那么我现在有一个现实的需求，就是需要确切收集“某个message_id切实影响到的draft，而不是整个session下的draft，因为整个session下的draft并不是所有都被这个message_id影响到了”。
+我现在是写了这样一个函数：
+def list_affected_drafts(
+        conn,
+        session_id: str,
+        message_id: str,
+        action_type: ActionType | str,
+        last_num: int | None = None
+) -> List[FixIncomeDraft]:
+    '''
+    返回该 session_id 下, 受 message_id 影响而执行 action_type 类得到的 drafts
+    '''
+
+    action_name = (
+        action_type.value
+        if isinstance(action_type, ActionType)
+        else str(action_type)
+    )
+    if last_num:
+        rows = conn.execute(
+            "
+            SELECT draft_id
+            FROM draft_events
+            WHERE session_id = ?
+            AND message_id = ?
+            AND action_type = ?
+            ORDER BY created_at ASC, rowid ASC
+            LIMIT ?
+            ",
+            (session_id, message_id, action_name, last_num),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "
+            SELECT draft_id
+            FROM draft_events
+            WHERE session_id = ?
+            AND message_id = ?
+            AND action_type = ?
+            ORDER BY created_at ASC, rowid ASC
+            ",
+            (session_id, message_id, action_name),
+        ).fetchall()
+
+    drafts_id = set([row['draft_id'] for row in rows])
+
+    return [get_draft(conn, draft_id) for draft_id in drafts_id ]
+我的出发点是这样的：首先某个message_id影响的draft，理论上只能取到draft的最新快照而不是影响发生时的状态了，因为我们把trade_drafts表设计成了覆盖式UPDATE的，所以messageA创建的draft，在被messageB修改后，再用messageA_id去查，是找不到创建时的drafts的，只能找到被B修改后的drafts状态。
+所以只能list_affected_drafts只能紧接着用在apply_action之后：只有紧接着apply_action(message_id)紧接着马上list_affected_drafts，才能在内存中得到message刚刚影响后的draft结果。那么下面这种用法对吗？
+updated_drafts = []
+for action in ActionsResponse.actions:
+    apply_action(
+        conn,
+        session_id = session.session_id,
+        drafts = ref_drafts,
+        action = action,
+        message_id = message_id
+    )
+    updated_drafts.append( qtrade_state_store.list_affected_drafts(conn, session.session_id, message_id, action.action_type, 1) )
+还是说是把action_type和limit都去掉重新写一个：
+for action in ActionsResponse.actions:
+    apply_action(
+        conn,
+        session_id = session.session_id,
+        drafts = ref_drafts,
+        action = action,
+        message_id = message_id
+    )
+updated_drafts = qtrade_state_store.list_affected_drafts(conn, session.session_id, message_id)
+```
+
+---
+🤖**assistant**:
+---
+
+# 一、先纠正一个关键误解
+
+你说：
+
+> 只能紧接着用在 apply_action 之后，才能在内存中得到 message 刚刚影响后的 draft 结果。
+
+这个理解**不完全对**。
+
+在 `process_message` 中，所有 actions 都是**同一个 `message_id`** 触发的，且在**同一个事务**（`with get_db() as conn`）内。所以在所有 actions 执行完后查询，得到的就是"这个 message 影响后的最终状态"。
+
+```python
+with get_db() as conn:
+    # 所有 actions 都在这里执行
+    for action in actions:
+        apply_action(...)
+
+    # 在这里查询，得到的就是"这个 message 影响后的最终状态"
+    # 不存在"被其他 message 修改"的问题
+    affected = list_affected_drafts(conn, session_id, message_id)
+```
+
+真正会出现"覆盖"问题的场景是：**跨消息**。比如：
+
+```text
+message_A 创建了 draft_1，price=100.85
+message_B 修改了 draft_1，price=100.90
+
+之后用 message_A 去查 draft_1，得到的是 100.90（被 B 覆盖了）
+```
+
+但在**同一个 `process_message` 内部**，不存在这个问题。
+
+---
+
+# 二、方案 A 的问题
+
+```python
+for action in ActionsResponse.actions:
+    apply_action(...)
+    updated_drafts.append(
+        list_affected_drafts(conn, session_id, message_id, action.action_type, 1)
+    )
+```
+
+有三个问题：
+
+| 问题 | 说明 |
+|---|---|
+| **重复查询** | 一个 action 可能更新多个字段（如同时改 price 和 amount），产生多条 events，`last_num=1` 只取一条，会漏 |
+| **重复返回** | 如果两个 actions 影响同一个 draft，会重复出现在结果中 |
+| **效率低** | 每个 action 执行后都查一次 DB，N 个 actions 就查 N 次 |
+
+---
+
+# 三、方案 B 是正确的方向，但需要调整
+
+你的方案 B：
+
+```python
+for action in ActionsResponse.actions:
+    apply_action(...)
+
+updated_drafts = list_affected_drafts(conn, session_id, message_id)
+```
+
+**方向正确**，但函数签名需要改。
+
+---
+
+# 四、推荐的最终实现
+
+## 4.1 修改 `list_affected_drafts`
+
+```python
+def list_affected_drafts(
+    conn,
+    session_id: str,
+    message_id: str,
+    action_type: Optional[ActionType | str] = None,
+) -> List[TradeDraft]:
+    """
+    返回该 session 下，受 message_id 影响而发生变更的 drafts。
+
+    参数：
+        action_type: 可选。如果指定，只返回该类型动作影响的 drafts；
+                     如果不指定，返回所有类型动作影响的 drafts。
+
+    注意：
+    - 返回的是 draft 的当前最新状态（覆盖式更新）
+    - 同一个 draft 被多个 action 影响时，只返回一次
+    - 过滤掉 draft_id 为 NULL 的记录（如 CLARIFY/NOOP 事件）
+    """
+    action_name = None
+    if action_type is not None:
+        action_name = (
+            action_type.value
+            if isinstance(action_type, ActionType)
+            else str(action_type)
+        )
+
+    if action_name:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT draft_id
+            FROM draft_events
+            WHERE session_id = ?
+              AND message_id = ?
+              AND action_type = ?
+              AND draft_id IS NOT NULL
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (session_id, message_id, action_name),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT draft_id
+            FROM draft_events
+            WHERE session_id = ?
+              AND message_id = ?
+              AND draft_id IS NOT NULL
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (session_id, message_id),
+        ).fetchall()
+
+    return [
+        draft
+        for row in rows
+        if (draft := get_draft(conn, row["draft_id"])) is not None
+    ]
+```
+
+### 关键改动
+
+| 改动 | 原因 |
+|---|---|
+| `action_type` 改为可选 | 大多数场景不需要按类型过滤 |
+| 去掉 `last_num` | 没有业务意义，且会导致漏取 |
+| 加 `DISTINCT` | 同一个 draft 被多个字段更新时，只返回一次 |
+| 加 `draft_id IS NOT NULL` | `CLARIFY` / `NOOP` 事件的 `draft_id` 为 NULL，需要过滤 |
+| 用 `Optional` 替代 `None` 默认值 | 类型更清晰 |
+
+---
+
+## 4.2 在 `process_message` 中的用法
+
+```python
+def process_message(
+    message: IncomingMessage,
+    resolver: SessionResolver,
+    extractor: ActionExtractor,
+) -> ProcessResult:
+
+    if not message.message_id:
+        message = message.model_copy(
+            update={"message_id": state_store.new_id("msg")}
+        )
+
+    with get_db() as conn:
+        resolution = resolver.resolve(conn, message)
+        session = resolution.session
+
+        message_id = state_store.upsert_message(
+            conn, message=message, session_id=session.session_id,
+        )
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+        history = state_store.list_recent_messages(
+            conn, session_id=session.session_id, limit=20,
+        )
+
+        llm_result = extractor.extract(
+            session=session, drafts=drafts,
+            history=history, message=message,
+        )
+
+        clarify_question = llm_result.clarify_question
+
+        # ────────────────────────────────────────────
+        # 逐个执行 Actions
+        # ────────────────────────────────────────────
+        for action in llm_result.actions:
+            local_clarify = apply_action(
+                conn,
+                session_id=session.session_id,
+                drafts=drafts,
+                action=action,
+                message_id=message_id,
+            )
+
+            if local_clarify and not clarify_question:
+                clarify_question = local_clarify
+
+            drafts = state_store.list_drafts(conn, session.session_id)
+
+        # ────────────────────────────────────────────
+        # 所有 actions 执行完后，一次性查询受影响的 drafts
+        # ────────────────────────────────────────────
+        affected_drafts = state_store.list_affected_drafts(
+            conn,
+            session_id=session.session_id,
+            message_id=message_id,
+        )
+
+        # ... 后续逻辑 ...
+
+        return ProcessResult(
+            session=session,
+            drafts=drafts,
+            affected_drafts=affected_drafts,  # ← 新增字段
+            actions=llm_result.actions,
+            clarify_question=clarify_question,
+            message_id=message_id,
+            settled_session=resolution.settled_session,
+            settled_drafts=resolution.settled_drafts,
+        )
+```
+
+---
+
+## 4.3 `ProcessResult` 模型更新
+
+```python
+class ProcessResult(BaseModel):
+    session: Session
+    drafts: List[TradeDraft] = Field(default_factory=list)
+    affected_drafts: List[TradeDraft] = Field(default_factory=list)  # ← 新增
+    actions: List[Action] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    message_id: str
+    settled_session: Optional[Session] = None
+    settled_drafts: List[TradeDraft] = Field(default_factory=list)
+```
+
+---
+
+# 五、`drafts` 和 `affected_drafts` 的区别
+
+| 字段 | 含义 | 用途 |
+|---|---|---|
+| `drafts` | 当前 session 下**所有**草稿 | 前端渲染完整状态 |
+| `affected_drafts` | 本次消息**实际影响到**的草稿 | 前端高亮/刷新变化的部分；下游系统只处理变化的部分 |
+
+示例：
+
+```text
+session 下有 3 个 drafts：draft_1, draft_2, draft_3
+
+本次消息只更新了 draft_1 的 price
+
+drafts = [draft_1, draft_2, draft_3]          ← 全量
+affected_drafts = [draft_1]                    ← 只有被影响的
+```
+
+---
+
+# 六、如果你需要"影响发生时的状态"怎么办？
+
+你提到：
+
+> 理论上只能取到 draft 的最新快照，而不是影响发生时的状态。
+
+在**同一个 `process_message` 内部**，这不是问题（所有 actions 都是同一个 message 的）。
+
+但如果你确实需要**跨消息**的历史快照（比如"message_A 创建 draft 时的状态"），有两种方案：
+
+## 方案 1：从 `draft_events` 重建（推荐）
+
+`draft_events` 表已经记录了每次变更的 `old_value` 和 `new_value`。可以通过回溯事件链重建任意时刻的状态。
+
+```python
+def get_draft_snapshot_at_message(
+    conn,
+    draft_id: str,
+    target_message_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    重建某个 draft 在指定 message 处理后的状态。
+    """
+    # 获取该 draft 的所有事件，按时间排序
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM draft_events
+        WHERE draft_id = ?
+        ORDER BY created_at ASC, rowid ASC
+        """,
+        (draft_id,),
+    ).fetchall()
+
+    # 从初始状态开始，逐步应用事件，直到目标 message
+    state = {}
+    for row in rows:
+        if row["message_id"] == target_message_id or state:
+            if row["field"]:
+                state[row["field"]] = row["new_value"]
+
+        if row["message_id"] == target_message_id:
+            break  # 到达目标 message，停止
+
+    return state if state else None
+```
+
+## 方案 2：在 `trade_drafts` 中加版本快照
+
+每次更新时，把旧状态存到一个 `draft_snapshots` 表。但这会增加存储成本，一般不推荐。
+
+---
+
+# 七、总结
+
+| 问题 | 结论 |
+|---|---|
+| 方案 A（每个 action 后查询） | ❌ 不推荐，效率低、会重复、会漏 |
+| 方案 B（所有 actions 后一次性查询） | ✅ 推荐 |
+| 是否需要"紧接着"查询 | ❌ 不需要，同一事务内不存在覆盖问题 |
+| 函数签名 | `action_type` 改为可选，去掉 `last_num`，加 `DISTINCT` 和 `IS NOT NULL` |
+| 放在 `ProcessResult` 中 | 新增 `affected_drafts` 字段 |
+
+
+---
+🙋**user**:
+---
+```
+你说推荐把 few-shot examples 做成多轮对话中的user-assitant对话，而不是塞在system prompt中。好那么repair prompt该怎么塞呢？
+总之请给我清晰的 system prompt、few-shot examples、repair prompt 以及regular input、repair input的构造。
+```
+
+---
+🤖**assistant**:
+---
+
+# 一、整体消息结构总览
+
+先给一个全局视图，再逐层展开。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    正常请求（attempt = 1）                       │
+├─────────────────────────────────────────────────────────────────┤
+│  messages = [                                                   │
+│    { role: "system",    content: SYSTEM_PROMPT },               │
+│    { role: "user",      content: FEW_SHOT_1_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_1_OUTPUT },           │
+│    { role: "user",      content: FEW_SHOT_2_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_2_OUTPUT },           │
+│    { role: "user",      content: FEW_SHOT_3_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_3_OUTPUT },           │
+│    { role: "user",      content: CURRENT_INPUT },               │
+│  ]                                                              │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    修复请求（attempt > 1）                       │
+├─────────────────────────────────────────────────────────────────┤
+│  messages = [                                                   │
+│    { role: "system",    content: SYSTEM_PROMPT },               │
+│    { role: "user",      content: FEW_SHOT_1_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_1_OUTPUT },           │
+│    { role: "user",      content: FEW_SHOT_2_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_2_OUTPUT },           │
+│    { role: "user",      content: FEW_SHOT_3_INPUT },            │
+│    { role: "assistant", content: FEW_SHOT_3_OUTPUT },           │
+│    { role: "user",      content: CURRENT_INPUT },               │
+│    { role: "assistant", content: BAD_OUTPUT },      ← 追加     │
+│    { role: "user",      content: REPAIR_INSTRUCTION }, ← 追加  │
+│  ]                                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心思路**：修复请求 = 正常请求 + 追加两条消息（上次的错误输出 + 修复指令）。
+
+---
+
+# 二、System Prompt 构造
+
+## 2.1 模板
+
+```python
+def build_system_prompt() -> str:
+    return """
+# Role
+你是一个银行间市场交易对话状态追踪助手。
+
+# Task
+根据【当前交易草稿状态】、【近期对话历史】和【最新一条消息】，
+分析最新消息带来了哪些增量状态变化，输出结构化的操作指令。
+
+# 字段抽取规则
+
+## asset_name（资产名称）
+- 特征：通常包含年份+发行人简称+品种，如"24长发金控PPN001"、"25诚通建投PPN001"
+- 抽取方法：识别"年份(2位数字) + 中文名称 + 可选字母数字后缀"的模式
+- 注意：同一只债券可能有简称和全称，如"24长发"和"24长发金控PPN001"，优先使用用户原文
+
+## asset_code（资产代码）
+- 特征：通常为数字+点+后缀，如"032481632.IB"、"252801220.IB"
+- 抽取方法：匹配"\\d{9}\\.[A-Z]{2}"或类似模式
+- 注意：如果用户只说了资产名称没说代码，不要编造代码
+
+## direction（交易方向）
+- 特征：买入/卖出/做/出/收/给等动词
+- 抽取方法：
+  - "做"、"收"、"买入" → direction = "bid"
+  - "出"、"给"、"卖出" → direction = "offer"
+- 注意：如果上下文无法判断方向，不要猜测
+
+## amount（交易金额/量）
+- 特征：通常带单位（万、亿、千万），或纯数字
+- 抽取方法：
+  - "2000" → 2000（默认单位为万）
+  - "2亿" → 20000（转换为万）
+  - "5000万" → 5000
+- 注意：区分"量"和"价"，不要把价格误识别为量
+
+## price（交易价格/收益率）
+- 特征：通常是小数（净价）或百分比（收益率）
+- 抽取方法：
+  - "100.85" → 100.85（净价）
+  - "2.35%" → 2.35（收益率）
+  - "1.95" → 可能是收益率，需结合上下文判断
+- 注意：区分"价"和"量"，不要把量误识别为价
+
+# 动作类型说明
+- CREATE: 发现新的交易意图，创建新草稿
+- UPDATE: 更新现有草稿的字段（价格、量、代码等）
+- CONFIRM: 用户明确确认/成交（"OK"、"可以"、"成交"、"done"）
+- REJECT: 用户明确拒绝（"不要了"、"算了"）
+- CANCEL: 用户明确取消（"取消"、"不做了"）
+- CLARIFY: 信息不足或有歧义，需要反问
+- NOOP: 当前消息没有有效状态变更（闲聊、问候等）
+
+# 输出格式
+严格输出 JSON，不要输出解释文本，不要输出 markdown。
+不要输出 ```json 包裹。
+
+Output Schema:
+{
+  "actions": [
+    {
+      "action_type": "UPDATE",
+      "target": {
+        "draft_id": "draft_xxx",
+        "asset_name": "24长发",
+        "reference_expression": "前者",
+        "ordinal": 1
+      },
+      "updates": {
+        "amount": 2000,
+        "price": 100.88
+      },
+      "confidence": 0.93,
+      "reasoning": "用户说前者量加到2000"
+    }
+  ],
+  "clarify_question": null
+}
+
+# 全局约束
+1. 只输出增量操作，不要输出完整状态
+2. 不要编造任何数字、代码、价格
+3. 无法定位目标草稿或信息不足时，输出 CLARIFY
+4. 不要输出 markdown，不要输出 ```json
+5. 严格输出合法 JSON
+""".strip()
+```
+
+## 2.2 结构说明
+
+```
+System Prompt 内部结构（从上到下）：
+
+1. Role          ← 角色定义
+2. Task          ← 任务描述
+3. 字段抽取规则   ← 你写的 NER 规则（按字段分块）
+4. 动作类型说明   ← 每种 action_type 的含义
+5. 输出格式       ← Output Schema
+6. 全局约束       ← 放在最后（近因效应）
+```
+
+**关键**：把**输出格式**和**全局约束**放在最后，利用模型的近因效应。
+
+---
+
+# 三、Few-shot Examples 构造
+
+## 3.1 示例数据定义
+
+```python
+FEW_SHOT_EXAMPLES: list[dict] = [
+    # ────────────────────────────────────────────
+    # 示例1: 简单字段更新（最基本的 UPDATE）
+    # ────────────────────────────────────────────
+    {
+        "input": """当前草稿状态：
+[{"draft_id":"draft_a1","asset_name":"24长发","asset_code":null,"direction":null,"amount":null,"price":100.85,"status":"negotiating"}]
+
+近期对话：
+- trader_A: 24长发有量吗？
+- trader_B: 100.85 有
+
+最新消息：
+- trader_A: 量给2000""",
+        "output": """{"actions":[{"action_type":"UPDATE","target":{"draft_id":"draft_a1","asset_name":"24长发"},"updates":{"amount":2000},"confidence":0.92,"reasoning":"用户要求将24长发的量设为2000"}],"clarify_question":null}"""
+    },
+
+    # ────────────────────────────────────────────
+    # 示例2: 指代消解（"前者"、"后者"）
+    # ────────────────────────────────────────────
+    {
+        "input": """当前草稿状态：
+[{"draft_id":"draft_b1","asset_name":"24长发","asset_code":null,"direction":null,"amount":1000,"price":100.85,"status":"negotiating"},{"draft_id":"draft_b2","asset_name":"25诚通","asset_code":null,"direction":null,"amount":1000,"price":100.36,"status":"negotiating"}]
+
+近期对话：
+- trader_A: 24长发和25诚通什么价？
+- trader_B: 长发100.85，诚通100.36
+- trader_A: 前者量加到2000，后者不要了
+
+最新消息：
+- trader_A: 前者量加到2000，后者不要了""",
+        "output": """{"actions":[{"action_type":"UPDATE","target":{"draft_id":"draft_b1","asset_name":"24长发","reference_expression":"前者","ordinal":1},"updates":{"amount":2000},"confidence":0.93,"reasoning":"用户说前者量加到2000，前者指24长发"},{"action_type":"REJECT","target":{"draft_id":"draft_b2","asset_name":"25诚通","reference_expression":"后者","ordinal":2},"confidence":0.91,"reasoning":"用户说后者不要了，后者指25诚通"}],"clarify_question":null}"""
+    },
+
+    # ────────────────────────────────────────────
+    # 示例3: 创建新草稿（CREATE）
+    # ────────────────────────────────────────────
+    {
+        "input": """当前草稿状态：
+[{"draft_id":"draft_c1","asset_name":"24长发","asset_code":null,"direction":null,"amount":2000,"price":100.85,"status":"negotiating"}]
+
+近期对话：
+- trader_A: 24长发 100.85 量2000
+- trader_B: OK
+
+最新消息：
+- trader_A: 另外再看一笔25诚通，100.3附近有没有""",
+        "output": """{"actions":[{"action_type":"CREATE","target":{"asset_name":"25诚通"},"updates":{"asset_name":"25诚通","price":100.3},"confidence":0.88,"reasoning":"用户说另外再看一笔25诚通，表示新建交易；100.3附近是价格意向"}],"clarify_question":null}"""
+    },
+
+    # ────────────────────────────────────────────
+    # 示例4: 确认（CONFIRM）
+    # ────────────────────────────────────────────
+    {
+        "input": """当前草稿状态：
+[{"draft_id":"draft_d1","asset_name":"24长发","asset_code":"032481632.IB","direction":"bid","amount":2000,"price":100.85,"status":"negotiating"}]
+
+近期对话：
+- trader_A: 24长发 100.85 量2000 做
+- trader_B: 可以
+
+最新消息：
+- trader_A: OK done""",
+        "output": """{"actions":[{"action_type":"CONFIRM","target":{"draft_id":"draft_d1","asset_name":"24长发"},"confidence":0.95,"reasoning":"用户回复OK done，确认成交"}],"clarify_question":null}"""
+    },
+
+    # ────────────────────────────────────────────
+    # 示例5: 信息不足需要反问（CLARIFY）
+    # ────────────────────────────────────────────
+    {
+        "input": """当前草稿状态：
+[{"draft_id":"draft_e1","asset_name":"24长发","asset_code":null,"direction":null,"amount":1000,"price":100.85,"status":"negotiating"},{"draft_id":"draft_e2","asset_name":"25诚通","asset_code":null,"direction":null,"amount":1000,"price":100.36,"status":"negotiating"}]
+
+近期对话：
+- trader_A: 24长发和25诚通有量吗？
+- trader_B: 各1000
+
+最新消息：
+- trader_A: 量改一下""",
+        "output": """{"actions":[{"action_type":"CLARIFY","target":null,"confidence":0.3,"reasoning":"用户说量改一下，但未指明改哪一笔，也未给出新的量"}],"clarify_question":"请问您要修改哪一笔的量？修改为多少？"}"""
+    },
+]
+```
+
+## 3.2 构造 few-shot messages
+
+```python
+def build_few_shot_messages() -> list[dict]:
+    """
+    将 few-shot 示例构造为 user/assistant 交替的消息列表。
+    """
+    messages = []
+
+    for example in FEW_SHOT_EXAMPLES:
+        messages.append({
+            "role": "user",
+            "content": example["input"],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": example["output"],
+        })
+
+    return messages
+```
+
+---
+
+# 四、当前真实输入构造
+
+```python
+def build_current_input(
+    *,
+    session: Session,
+    drafts: List[TradeDraft],
+    history: List[MessageRecord],
+    message: IncomingMessage,
+) -> str:
+    """
+    构造当前真实输入（不含 few-shot，不含 system prompt）。
+    """
+    drafts_payload = [
+        {
+            "draft_id": d.draft_id,
+            "asset_name": d.asset_name,
+            "asset_code": d.asset_code,
+            "direction": d.direction,
+            "amount": d.amount,
+            "price": d.price,
+            "status": d.status,
+        }
+        for d in drafts
+    ]
+
+    history_lines = []
+    for item in history[-10:]:
+        history_lines.append(f"- {item.sender_id}: {item.content}")
+
+    history_text = "\n".join(history_lines) if history_lines else "（无）"
+
+    return f"""当前草稿状态：
+{json.dumps(drafts_payload, ensure_ascii=False)}
+
+近期对话：
+{history_text}
+
+最新消息：
+- {message.sender_id}: {message.content}"""
+```
+
+---
+
+# 五、完整消息组装
+
+## 5.1 正常请求
+
+```python
+def build_messages(
+    *,
+    session: Session,
+    drafts: List[TradeDraft],
+    history: List[MessageRecord],
+    message: IncomingMessage,
+) -> list[dict]:
+    """
+    构造正常请求的完整 messages 数组。
+
+    结构：
+      [system] + [few-shot pairs] + [current input]
+    """
+    messages = []
+
+    # 1. System Prompt
+    messages.append({
+        "role": "system",
+        "content": build_system_prompt(),
+    })
+
+    # 2. Few-shot 示例（user/assistant 交替）
+    messages.extend(build_few_shot_messages())
+
+    # 3. 当前真实输入
+    messages.append({
+        "role": "user",
+        "content": build_current_input(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        ),
+    })
+
+    return messages
+```
+
+## 5.2 修复请求
+
+```python
+def build_repair_messages(
+    *,
+    base_messages: list[dict],
+    bad_output: str,
+    error_message: str,
+) -> list[dict]:
+    """
+    在正常请求的基础上追加两条消息，构造修复请求。
+
+    结构：
+      [正常请求的所有消息]
+      + { role: "assistant", content: bad_output }
+      + { role: "user",      content: repair_instruction }
+
+    参数：
+        base_messages: 正常请求的完整 messages（包含 system + few-shot + current input）
+        bad_output:    模型上次的错误输出
+        error_message: 解析错误原因
+    """
+    repair_instruction = f"""你上一次的输出不是合法的 JSON，或不符合 Output Schema。
+
+解析错误：{error_message}
+
+请你重新输出。要求：
+1. 只输出最终合法 JSON
+2. 不要输出解释文本
+3. 不要输出 markdown
+4. 不要输出 ```json 包裹
+5. 必须符合 System Prompt 中定义的 Output Schema"""
+
+    # 复制一份，避免修改原列表
+    messages = list(base_messages)
+
+    # 追加上次错误输出（作为 assistant 消息）
+    messages.append({
+        "role": "assistant",
+        "content": bad_output,
+    })
+
+    # 追加修复指令（作为 user 消息）
+    messages.append({
+        "role": "user",
+        "content": repair_instruction,
+    })
+
+    return messages
+```
+
+---
+
+# 六、API 调用层
+
+## 6.1 `call_qwen_api` 改为接收 messages 数组
+
+```python
+def call_qwen_api(messages: list[dict]) -> str:
+    """
+    调用 Qwen / OpenAI-compatible chat completion API。
+
+    参数：
+        messages: 完整的消息数组（包含 system + few-shot + 输入）
+    """
+    if not config.QWEN_API_KEY:
+        raise RuntimeError("QWEN_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {config.QWEN_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    base_payload = {
+        "model": config.QWEN_MODEL,
+        "temperature": 0,
+        "messages": messages,
+    }
+
+    if config.QWEN_USE_RESPONSE_FORMAT:
+        payload = dict(base_payload)
+        payload["response_format"] = {"type": "json_object"}
+
+        try:
+            return _post_qwen(headers, payload)
+        except RuntimeError as exc:
+            if "response_format" in str(exc):
+                fallback_payload = dict(base_payload)
+                return _post_qwen(headers, fallback_payload)
+            raise
+    else:
+        return _post_qwen(headers, base_payload)
+
+
+def _post_qwen(headers: dict, payload: dict) -> str:
+    response = requests.post(
+        config.QWEN_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=config.LLM_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"] or ""
+```
+
+---
+
+# 七、`QwenActionExtractor` 重写
+
+```python
+class QwenActionExtractor(ActionExtractor):
+    """
+    真实 Qwen 增量状态抽取器。
+
+    消息结构：
+      正常请求: [system] + [few-shot] + [current input]
+      修复请求: [system] + [few-shot] + [current input] + [bad output] + [repair instruction]
+    """
+
+    def extract(
+        self,
+        *,
+        session: Session,
+        drafts: List[TradeDraft],
+        history: List[MessageRecord],
+        message: IncomingMessage,
+    ) -> LLMActionsResponse:
+
+        # ────────────────────────────────────────
+        # Step 1: 构造正常请求的 messages（只构造一次）
+        # ────────────────────────────────────────
+        base_messages = build_messages(
+            session=session,
+            drafts=drafts,
+            history=history,
+            message=message,
+        )
+
+        last_raw_output = ""
+        last_error: Optional[Exception] = None
+
+        # ────────────────────────────────────────
+        # Step 2: 重试循环
+        # ────────────────────────────────────────
+        for attempt in range(1, config.LLM_MAX_RETRIES + 1):
+
+            if attempt == 1:
+                # 正常请求
+                current_messages = base_messages
+            else:
+                # 修复请求：在正常请求基础上追加
+                current_messages = build_repair_messages(
+                    base_messages=base_messages,
+                    bad_output=last_raw_output,
+                    error_message=str(last_error),
+                )
+
+            try:
+                raw_output = call_qwen_api(current_messages)
+                last_raw_output = raw_output
+
+                parsed = parse_llm_actions(raw_output)
+
+                logger.info(
+                    "Qwen extraction succeeded, session=%s, attempt=%d, actions=%d",
+                    session.session_id,
+                    attempt,
+                    len(parsed.actions),
+                )
+
+                return parsed
+
+            except ActionParseError as exc:
+                last_error = exc
+                logger.warning(
+                    "Qwen output parse failed, session=%s, attempt=%d, error=%s",
+                    session.session_id,
+                    attempt,
+                    exc,
+                )
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Qwen API call failed, session=%s, attempt=%d, error=%s",
+                    session.session_id,
+                    attempt,
+                    exc,
+                )
+
+            if attempt < config.LLM_MAX_RETRIES:
+                sleep_seconds = 0.5 * (2 ** (attempt - 1))
+                time.sleep(sleep_seconds)
+
+        # ────────────────────────────────────────
+        # Step 3: 全部失败，降级
+        # ────────────────────────────────────────
+        logger.exception(
+            "Qwen extraction failed after %d retries, session=%s",
+            config.LLM_MAX_RETRIES,
+            session.session_id,
+        )
+
+        return LLMActionsResponse(
+            actions=[
+                Action(
+                    action_type=ActionType.NOOP,
+                    reasoning=f"extraction failed after retries: {last_error}",
+                )
+            ],
+            clarify_question=(
+                "抱歉，系统暂时无法理解这条消息。"
+                "请明确说明标的、字段和数值，例如：24长发，量改为2000。"
+            ),
+        )
+```
+
+---
+
+# 八、完整消息流可视化
+
+## 8.1 正常请求（attempt=1）
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ system                                                       │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ # Role                                                   │ │
+│ │ 你是一个银行间市场交易对话状态追踪助手。                    │ │
+│ │                                                          │ │
+│ │ # Task                                                   │ │
+│ │ ...                                                      │ │
+│ │                                                          │ │
+│ │ # 字段抽取规则                                            │ │
+│ │ ## asset_name ...                                        │ │
+│ │ ## amount ...                                            │ │
+│ │ ## price ...                                             │ │
+│ │                                                          │ │
+│ │ # 动作类型说明                                            │ │
+│ │ - CREATE / UPDATE / CONFIRM / ...                        │ │
+│ │                                                          │ │
+│ │ # 输出格式                                                │ │
+│ │ { "actions": [...], "clarify_question": null }           │ │
+│ │                                                          │ │
+│ │ # 全局约束                                                │ │
+│ │ 1. 只输出增量操作 ...                                     │ │
+│ │ 5. 严格输出合法 JSON                                      │ │
+│ └──────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────┤
+│ user (few-shot 1 input)                                      │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ 当前草稿状态：[{"draft_id":"draft_a1",...}]              │ │
+│ │ 近期对话：...                                             │ │
+│ │ 最新消息：- trader_A: 量给2000                            │ │
+│ └──────────────────────────────────────────────────────────┘ │
+│ assistant (few-shot 1 output)                                │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ {"actions":[{"action_type":"UPDATE",...}]}               │ │
+│ └──────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────┤
+│ user (few-shot 2 input)                                      │
+│ assistant (few-shot 2 output)                                │
+├──────────────────────────────────────────────────────────────┤
+│ user (few-shot 3 input)                                      │
+│ assistant (few-shot 3 output)                                │
+├──────────────────────────────────────────────────────────────┤
+│ user (few-shot 4 input)                                      │
+│ assistant (few-shot 4 output)                                │
+├──────────────────────────────────────────────────────────────┤
+│ user (few-shot 5 input)                                      │
+│ assistant (few-shot 5 output)                                │
+├──────────────────────────────────────────────────────────────┤
+│ user (current input) ← 当前真实输入                           │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ 当前草稿状态：[{"draft_id":"draft_x1",...}]              │ │
+│ │ 近期对话：                                                │ │
+│ │ - trader_A: 24长发和25诚通有量吗？                        │ │
+│ │ - trader_B: 长发100.85，诚通100.36                       │ │
+│ │ 最新消息：                                                │ │
+│ │ - trader_A: 前者量加到2000                                │ │
+│ └──────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## 8.2 修复请求（attempt=2）
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ （与正常请求完全相同的所有消息）                                │
+│ system + few-shot × 5 + current input                        │
+├──────────────────────────────────────────────────────────────┤
+│ assistant (bad output) ← 追加                                │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ ```json                                                  │ │
+│ │ {"actions": [{"action_type": "UPDATE", ...               │ │
+│ │ （上次的错误/非法输出）                                    │ │
+│ └──────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────┤
+│ user (repair instruction) ← 追加                             │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ 你上一次的输出不是合法的 JSON，或不符合 Output Schema。     │ │
+│ │                                                          │ │
+│ │ 解析错误：Unexpected token '`' at position 0             │ │
+│ │                                                          │ │
+│ │ 请你重新输出。要求：                                      │ │
+│ │ 1. 只输出最终合法 JSON                                    │ │
+│ │ 2. 不要输出解释文本                                       │ │
+│ │ 3. 不要输出 markdown                                     │ │
+│ │ 4. 不要输出 ```json 包裹                                  │ │
+│ │ 5. 必须符合 System Prompt 中定义的 Output Schema          │ │
+│ └──────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 九、Token 成本估算
+
+| 部分 | 估算 Token |
+|---|---|
+| System Prompt（规则 + 格式） | ~800 |
+| Few-shot × 5（输入 + 输出） | ~1500 |
+| 当前输入（状态 + 历史 + 消息） | ~300 |
+| **正常请求总计** | **~2600** |
+| 修复追加（bad output + instruction） | ~200 |
+| **修复请求总计** | **~2800** |
+
+如果 token 成本敏感，可以把 few-shot 减到 3 个，节省约 600 token。
+
+---
+
+# 十、总结
+
+| 组件 | 放在哪里 | 说明 |
+|---|---|---|
+| 角色 + 规则 + 输出格式 | `system` | 每次请求不变 |
+| Few-shot 示例 | `user/assistant` 交替 | 放在 system 之后、真实输入之前 |
+| 当前真实输入 | `user` | 每次请求不同 |
+| 上次错误输出 | `assistant`（仅修复时追加） | 让模型"看到"自己上次说了什么 |
+| 修复指令 | `user`（仅修复时追加） | 放在最后，利用近因效应 |
+
