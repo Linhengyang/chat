@@ -16391,3 +16391,551 @@ class QwenActionExtractor(ActionExtractor):
 | 上次错误输出 | `assistant`（仅修复时追加） | 让模型"看到"自己上次说了什么 |
 | 修复指令 | `user`（仅修复时追加） | 放在最后，利用近因效应 |
 
+
+---
+🙋**user**:
+---
+```
+如何把代码测试跑起来？首先帮我重写main.py，去掉 feedback 和 maintenance，只测主逻辑。然后帮我生成简单的测试脚本不要复杂。
+```
+
+---
+🤖**assistant**:
+---
+
+# 一、重写 `main.py`
+
+去掉 feedback 和 maintenance，只保留核心主逻辑路由。
+
+```python
+"""
+精简版主入口 —— 仅保留核心消息处理 / 会话查询 / 结算逻辑。
+不含 feedback、不含 maintenance 后台轮询。
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, status as http_status
+
+from src.db import init_db, get_db
+from src import state_store
+from src.models import (
+    IncomingMessage,
+    ProcessResult,
+    SessionDetail,
+    SessionSettleResult,
+)
+from src.service import process_message
+from src.session_resolver import DefaultSessionResolver
+from src.llm import get_action_extractor
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("DB initialized, service ready.")
+    yield
+
+
+app = FastAPI(
+    title="Trade Dialogue DST (Lite)",
+    version="0.5.0",
+    lifespan=lifespan,
+)
+
+
+# ────────────────────────────────────────────
+# 核心：接收消息
+# ────────────────────────────────────────────
+
+@app.post("/api/messages", response_model=ProcessResult)
+def api_process_message(payload: IncomingMessage):
+    resolver = DefaultSessionResolver()
+    extractor = get_action_extractor()
+    return process_message(
+        message=payload,
+        resolver=resolver,
+        extractor=extractor,
+    )
+
+
+# ────────────────────────────────────────────
+# 查询 session 详情
+# ────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}", response_model=SessionDetail)
+def api_get_session(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        drafts = state_store.list_drafts(conn, session_id)
+        messages = state_store.list_recent_messages(conn, session_id, limit=100)
+        return SessionDetail(session=session, drafts=drafts, messages=messages)
+
+
+# ────────────────────────────────────────────
+# 查询 session 下的 drafts
+# ────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/drafts")
+def api_get_drafts(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        return state_store.list_drafts(conn, session_id)
+
+
+# ────────────────────────────────────────────
+# 查询 session 下的事件
+# ────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/events")
+def api_get_events(session_id: str):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        return state_store.list_events(conn, session_id)
+
+
+# ────────────────────────────────────────────
+# 手动结算
+# ────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/settle", response_model=SessionSettleResult)
+def api_settle_session(session_id: str, reason: Optional[str] = None):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_MANUAL,
+            reasoning=reason or "manual settle",
+        )
+        return SessionSettleResult(session=settled_session, drafts=settled_drafts)
+
+
+# ────────────────────────────────────────────
+# 手动取消
+# ────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/cancel", response_model=SessionSettleResult)
+def api_cancel_session(session_id: str, reason: Optional[str] = None):
+    with get_db() as conn:
+        session = state_store.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        settled_session, settled_drafts = state_store.settle_session(
+            conn,
+            session_id=session_id,
+            close_reason=state_store.CLOSE_REASON_USER_CANCEL,
+            reasoning=reason or "user cancel",
+        )
+        return SessionSettleResult(session=settled_session, drafts=settled_drafts)
+
+
+# ────────────────────────────────────────────
+# 健康检查
+# ────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+---
+
+# 二、测试脚本 `test_flow.py`
+
+放在项目根目录，直接 `python test_flow.py` 运行。
+
+```python
+"""
+简单端到端测试脚本。
+先启动服务：uvicorn main:app --port 8000
+然后运行：  python test_flow.py
+"""
+
+import requests
+import json
+
+BASE = "http://127.0.0.1:8000"
+
+
+def send(content: str, sender: str = "trader_A", receiver: str = "trader_B"):
+    """发送一条消息，返回响应。"""
+    resp = requests.post(f"{BASE}/api/messages", json={
+        "sender_id": sender,
+        "receiver_id": receiver,
+        "channel": "qq",
+        "content": content,
+    })
+    resp.raise_for_status()
+    return resp.json()
+
+
+def pretty(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def main():
+    print("=" * 60)
+    print("Step 0: 健康检查")
+    print("=" * 60)
+    r = requests.get(f"{BASE}/health")
+    print(r.json())
+    assert r.status_code == 200
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 1: 发送第一条消息（应创建草稿）")
+    print("=" * 60)
+    result = send("24长发 100.85 量2000 做")
+    pretty(result)
+
+    session_id = result["session"]["session_id"]
+    print(f"\n>>> session_id = {session_id}")
+    assert result["message_id"], "应该有 message_id"
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 2: 更新价格")
+    print("=" * 60)
+    result = send("价格改成100.90")
+    pretty(result)
+    assert result["session"]["session_id"] == session_id, "应该在同一个 session"
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 3: 确认成交")
+    print("=" * 60)
+    result = send("OK 确认")
+    pretty(result)
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 4: 查看当前 session 状态")
+    print("=" * 60)
+    r = requests.get(f"{BASE}/api/sessions/{session_id}")
+    r.raise_for_status()
+    pretty(r.json())
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 5: 查看 drafts")
+    print("=" * 60)
+    r = requests.get(f"{BASE}/api/sessions/{session_id}/drafts")
+    r.raise_for_status()
+    pretty(r.json())
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 6: 手动结算")
+    print("=" * 60)
+    r = requests.post(f"{BASE}/api/sessions/{session_id}/settle")
+    r.raise_for_status()
+    pretty(r.json())
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 7: 结算后查看 drafts（确认 is_complete 和 slot 状态）")
+    print("=" * 60)
+    r = requests.get(f"{BASE}/api/sessions/{session_id}/drafts")
+    r.raise_for_status()
+    pretty(r.json())
+
+    # ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 8: 查看事件流水")
+    print("=" * 60)
+    r = requests.get(f"{BASE}/api/sessions/{session_id}/events")
+    r.raise_for_status()
+    pretty(r.json())
+
+    print("\n" + "=" * 60)
+    print("全部测试通过 ✓")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# 三、启动步骤
+
+## 3.1 安装依赖
+
+```bash
+pip install fastapi uvicorn pydantic requests
+```
+
+## 3.2 确保目录结构
+
+```
+trade-dialogue-ner/
+├── main.py            ← 上面重写的精简版
+├── test_flow.py       ← 测试脚本
+├── data/
+│   └── .gitkeep
+└── src/
+    ├── __init__.py
+    ├── config.py
+    ├── models.py
+    ├── db.py
+    ├── state_store.py
+    ├── session_resolver.py
+    ├── llm.py
+    ├── json_utils.py
+    ├── parsing.py
+    └── service.py
+```
+
+**注意**：不需要 `feedback_store.py`、`maintenance.py`、`api.py`。
+
+## 3.3 确保 `src/config.py` 中 mock 模式
+
+```bash
+export LLM_PROVIDER=mock
+```
+
+或者确认 `config.py` 中默认值已经是 `mock`：
+
+```python
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
+```
+
+## 3.4 启动服务
+
+```bash
+uvicorn main:app --port 8000
+```
+
+## 3.5 运行测试
+
+另开一个终端：
+
+```bash
+python test_flow.py
+```
+
+---
+
+# 四、预期输出
+
+如果一切正常，你会看到类似：
+
+```
+Step 1: 发送第一条消息（应创建草稿）
+{
+  "session": { "session_id": "session_xxx", "status": "active", ... },
+  "drafts": [ { "draft_id": "draft_xxx", "asset_name": "24长发", ... } ],
+  "actions": [ { "action_type": "CREATE", ... } ],
+  "message_id": "msg_xxx",
+  "settled_session": null,
+  "settled_drafts": []
+}
+
+Step 6: 手动结算
+{
+  "session": { "session_id": "session_xxx", "status": "closed", ... },
+  "drafts": [
+    {
+      "draft_id": "draft_xxx",
+      "is_complete": true,
+      "slots": {
+        "asset_name": { "value": "24长发", "status": "confirmed" },
+        "amount":     { "value": 2000,     "status": "confirmed" },
+        "price":      { "value": 100.9,    "status": "confirmed" }
+      }
+    }
+  ]
+}
+
+全部测试通过 ✓
+```
+
+---
+
+# 五、如果遇到问题
+
+| 问题 | 解决 |
+|---|---|
+| `ModuleNotFoundError: src` | 确保在项目根目录运行，或加 `export PYTHONPATH=.` |
+| `QWEN_API_KEY is not set` | 确保 `LLM_PROVIDER=mock`，不走真实 API |
+| `table xxx not found` | 删除 `data/app.db` 后重启，让 `init_db()` 重建 |
+| mock 没有识别出草稿 | 检查 `src/llm.py` 中 `MockActionExtractor` 的正则是否匹配你的输入格式 |
+
+
+---
+🙋**user**:
+---
+```
+你这里config.py也没办法直接读取.env文件啊？你能把事情做好吗？
+```
+
+---
+🤖**assistant**:
+---
+
+你说得对，`os.getenv()` 只能读系统环境变量，读不了 `.env` 文件。需要加 `python-dotenv`。
+
+---
+
+# 一、`requirements.txt`
+
+```txt
+fastapi
+uvicorn[standard]
+pydantic>=2
+requests
+python-dotenv
+```
+
+---
+
+# 二、`.env` 文件（项目根目录）
+
+```env
+# LLM 配置
+LLM_PROVIDER=mock
+# LLM_PROVIDER=qwen
+# QWEN_API_KEY=sk-xxxxxx
+# QWEN_MODEL=qwen-plus
+# QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+# QWEN_USE_RESPONSE_FORMAT=false
+
+# 会话超时（分钟）
+SESSION_TIMEOUT_MINUTES=30
+
+# LLM 重试
+LLM_MAX_RETRIES=3
+LLM_TIMEOUT_SECONDS=30
+```
+
+---
+
+# 三、`src/config.py` 重写
+
+关键：**`load_dotenv()` 必须在所有 `os.getenv()` 之前执行**。
+
+```python
+import os
+from pathlib import Path
+
+# ────────────────────────────────────────────
+# 路径
+# ────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ────────────────────────────────────────────
+# 加载 .env（必须在所有 os.getenv 之前）
+# ────────────────────────────────────────────
+from dotenv import load_dotenv
+
+load_dotenv(BASE_DIR / ".env", override=False)
+
+# ────────────────────────────────────────────
+# 数据库
+# ────────────────────────────────────────────
+DB_PATH = DATA_DIR / "app.db"
+
+# ────────────────────────────────────────────
+# 会话
+# ────────────────────────────────────────────
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+
+# ────────────────────────────────────────────
+# LLM
+# ────────────────────────────────────────────
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+QWEN_API_URL = os.getenv(
+    "QWEN_API_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+)
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+
+
+QWEN_USE_RESPONSE_FORMAT = _env_bool("QWEN_USE_RESPONSE_FORMAT", False)
+```
+
+---
+
+# 四、目录结构确认
+
+```
+trade-dialogue-ner/
+├── .env               ← 环境变量配置
+├── main.py
+├── test_flow.py
+├── requirements.txt
+├── data/
+│   └── .gitkeep
+└── src/
+    ├── __init__.py
+    ├── config.py       ← 上面重写的
+    ├── models.py
+    ├── db.py
+    ├── state_store.py
+    ├── session_resolver.py
+    ├── llm.py
+    ├── json_utils.py
+    ├── parsing.py
+    └── service.py
+```
+
+---
+
+# 五、安装和启动
+
+```bash
+pip install -r requirements.txt
+
+# 确认 .env 中 LLM_PROVIDER=mock
+
+uvicorn main:app --port 8000
+```
+
+另一个终端：
+
+```bash
+python test_flow.py
+```
+
+---
+
+# 六、`load_dotenv` 的 `override=False` 含义
+
+```python
+load_dotenv(BASE_DIR / ".env", override=False)
+```
+
+| 参数 | 行为 |
+|---|---|
+| `override=False` | 系统环境变量优先，`.env` 只补充缺失的 |
+| `override=True` | `.env` 优先，覆盖系统环境变量 |
+
+默认用 `False`，这样你在命令行 `export LLM_PROVIDER=qwen` 时不会被 `.env` 里的 `mock` 覆盖。
+
