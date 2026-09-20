@@ -16939,3 +16939,865 @@ load_dotenv(BASE_DIR / ".env", override=False)
 
 默认用 `False`，这样你在命令行 `export LLM_PROVIDER=qwen` 时不会被 `.env` 里的 `mock` 覆盖。
 
+
+---
+🙋**user**:
+---
+```
+我想打印错误。我发现每个py文件都有一个logger=logging.getLogger(__name__)。那么它和从 一个完整的log.py import logger有什么区别？都能打印出错误吗？
+```
+
+---
+🤖**assistant**:
+---
+
+` 标签 | 你想知道错误来自哪个模块 |
+| 所有文件共用一个 `logger` | 模块来源不重要，或者项目很小 |
+
+对于你当前的项目（`src/` 下有 8~10 个模块），**推荐每个文件用自己的 `__name__` logger**，在 `main.py` 统一配置格式。这样出错时你能立刻看到：
+
+```
+2026-06-22 10:05:03 [ERROR] [src.llm] Qwen output parse failed...
+2026-06-22 10:05:03 [ERROR] [src.state_store] Failed to settle draft...
+```
+
+而不是：
+
+```
+2026-06-22 10:05:03 [ERROR] [app] Qwen output parse failed...
+2026-06-22 10:05:03 [ERROR] [app] Failed to settle draft...
+```
+
+后者你分不清错误来自哪个模块。
+
+
+---
+🙋**user**:
+---
+```
+为什么看不到日志输出？
+```
+
+---
+🤖**assistant**:
+---
+
+最常见的原因是：**你没有配置 logging 的 handler 和 level**。
+
+---
+
+# 一、根本原因
+
+Python `logging` 模块的默认行为：
+
+```text
+默认 level = WARNING
+默认 handler = 无
+```
+
+所以：
+
+| 你写的 | 能不能看到 |
+|---|---|
+| `logger.debug(...)` | ❌ 看不到 |
+| `logger.info(...)` | ❌ 看不到 |
+| `logger.warning(...)` | ⚠️ 可能看到（取决于是否配置了 lastResort） |
+| `logger.error(...)` | ⚠️ 可能看到 |
+| `logger.exception(...)` | ⚠️ 可能看到 |
+
+而且即使你写了 `logger = logging.getLogger(__name__)`，如果**主入口没有配置过**，这个 logger 没有任何 handler，日志就**静默丢弃**。
+
+---
+
+# 二、验证问题
+
+在你的 `main.py` 最顶部（所有 import 之前）临时加一行：
+
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+重启服务，如果能看到日志了，就确认是这个问题。
+
+---
+
+# 三、正确解决方案
+
+在 `main.py` 的**最顶部**（所有其他 import 之前）加上：
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+```
+
+完整位置：
+
+```python
+# main.py 最顶部，第一行
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# 然后才是其他 import
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from src.db import init_db, get_db
+# ...
+```
+
+**必须在其他模块之前**，因为其他模块在 import 时就会执行 `logging.getLogger(__name__)`。如果 `basicConfig` 在后面才调用，某些模块的 logger 可能已经初始化了。
+
+---
+
+# 四、为什么必须放最顶部？
+
+```text
+main.py 执行顺序：
+
+1. import logging
+2. logging.basicConfig(...)   ← 配置根 logger
+3. from src.db import ...      ← 此时 src/db.py 被导入
+                                ← src/db.py 里执行 logger = logging.getLogger("src.db")
+                                ← 这个 logger 会继承根 logger 的 handler
+4. from src.llm import ...     ← 同理
+```
+
+如果 `basicConfig` 放在后面：
+
+```text
+1. from src.llm import ...     ← src/llm.py 被导入
+                                ← logger = logging.getLogger("src.llm")
+                                ← 此时根 logger 还没配置，无 handler
+2. logging.basicConfig(...)   ← 太晚了，某些 logger 已经创建了
+```
+
+实际上 `basicConfig` 配置的是**根 logger**，子 logger 会向上查找，所以大多数情况下顺序没那么严格。但放最顶部是**最安全的做法**。
+
+---
+
+# 五、如果你想更精细控制
+
+比如你只想看自己代码的日志，不想看 `uvicorn`、`fastapi` 的大量日志：
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# 降低第三方库的日志级别
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("fastapi").setLevel(logging.WARNING)
+
+# 确保自己的模块日志可见
+logging.getLogger("src").setLevel(logging.DEBUG)
+```
+
+这样：
+
+| 模块 | 看到的级别 |
+|---|---|
+| `src.llm` | DEBUG 及以上 |
+| `src.state_store` | DEBUG 及以上 |
+| `uvicorn` | WARNING 及以上 |
+
+---
+
+# 六、如果用 uvicorn 启动，日志可能被它接管
+
+`uvicorn` 有自己的日志配置，可能会覆盖你的 `basicConfig`。
+
+如果遇到这种情况，用 `--log-config` 参数或者在 `main.py` 中用 `dictConfig`：
+
+```python
+import logging
+import logging.config
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "stream": "ext://sys.stdout",
+        },
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console"],
+    },
+    "loggers": {
+        "uvicorn": {
+            "level": "WARNING",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "uvicorn.access": {
+            "level": "WARNING",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "src": {
+            "level": "DEBUG",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+    },
+}
+
+logging.config.dictConfig(LOGGING_CONFIG)
+```
+
+放在 `main.py` 最顶部，在所有其他 import 之前。
+
+---
+
+# 七、最简单的修复（推荐先用这个）
+
+在 `main.py` 第一行加：
+
+```python
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
+```
+
+重启：
+
+```bash
+uvicorn main:app --port 8000 --reload
+```
+
+然后跑测试：
+
+```bash
+python test_flow.py
+```
+
+你应该能看到：
+
+```
+2026-06-22 10:05:03 [INFO] [src.llm] Qwen extraction succeeded, session=session_xxx, attempt=1, actions=1
+2026-06-22 10:05:03 [INFO] [src.state_store] Settled expired session: session_xxx
+```
+
+如果还是看不到，检查你的代码里是不是用了 `print` 而不是 `logger.info`，或者 level 写成了 `logger.debug` 但你配置的是 `INFO`。
+
+
+---
+🙋**user**:
+---
+```
+我在具体跑服务时，遇到问题：create_session时，conn.execute触发
+sqlite3.OperationError: database is locked
+请帮忙分析原因
+```
+
+---
+🤖**assistant**:
+---
+
+# 一、原因分析
+
+`sqlite3.OperationalError: database is locked` 的本质是：**有另一个连接正在写数据库，当前连接拿不到写锁。**
+
+在你的架构中，最可能的原因有以下几个：
+
+---
+
+## 原因 1：FastAPI 同步路由的线程池并发（最可能）
+
+你的路由是同步函数：
+
+```python
+@app.post("/api/messages", response_model=ProcessResult)
+def api_process_message(payload: IncomingMessage):  # ← def，不是 async def
+    ...
+```
+
+FastAPI 会把同步路由放到**线程池**中执行。如果两个请求几乎同时到达：
+
+```
+线程1: conn_A 开始写（事务未提交）
+线程2: conn_B 尝试写 → 发现数据库被锁 → 等待超时 → 报错
+```
+
+即使你的测试脚本是顺序的，`uvicorn` 内部也可能有微小的并发窗口（比如前一个请求的事务还没完全关闭，下一个就来了）。
+
+---
+
+## 原因 2：SQLite 默认 journal_mode 是 DELETE（非 WAL）
+
+SQLite 默认使用 **rollback journal** 模式：
+
+```
+写操作时：锁住整个数据库文件
+其他连接：完全不能读写
+```
+
+而 **WAL（Write-Ahead Logging）模式**：
+
+```
+写操作时：只锁写
+其他连接：仍然可以读
+写-写冲突时：等待而不是立刻报错
+```
+
+---
+
+## 原因 3：连接超时太短
+
+`sqlite3.connect()` 默认 `timeout=5`（秒）。如果锁被持有超过 5 秒，就会抛 `OperationalError`。
+
+---
+
+## 原因 4：`PRAGMA foreign_keys=ON` 的隐式事务
+
+你的 `get_connection()` 中：
+
+```python
+conn.execute("PRAGMA foreign_keys=ON")
+```
+
+这条 `PRAGMA` 本身会开启一个隐式事务。如果之后 `conn.close()` 前没有正确 `commit/rollback`，可能导致锁残留。
+
+---
+
+# 二、解决方案
+
+## 2.1 修改 `src/db.py`（核心修复）
+
+```python
+import sqlite3
+from contextlib import contextmanager
+
+from .config import DB_PATH
+
+
+SCHEMA = """
+...（保持不变）
+"""
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,                # ← 等待锁的超时时间，从默认5秒改为30秒
+        check_same_thread=False,   # ← 允许跨线程使用（FastAPI线程池需要）
+    )
+    conn.row_factory = sqlite3.Row
+
+    # 开启 WAL 模式（大幅减少锁冲突）
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    # 开启外键约束
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    return conn
+
+
+@contextmanager
+def get_db():
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.executescript(SCHEMA)
+```
+
+### 改了什么
+
+| 改动 | 作用 |
+|---|---|
+| `timeout=30` | 遇到锁时等待最多 30 秒，而不是立刻报错 |
+| `check_same_thread=False` | 允许连接在线程池中被使用 |
+| `PRAGMA journal_mode=WAL` | 读写分离，大幅减少锁冲突 |
+
+---
+
+## 2.2 如果还报错：加应用层锁
+
+如果并发量确实存在（比如多个请求同时写入），可以加一个**全局写锁**，让写操作串行化：
+
+```python
+import sqlite3
+import threading
+from contextlib import contextmanager
+
+from .config import DB_PATH
+
+# 全局写锁：确保同一时刻只有一个线程在写数据库
+_write_lock = threading.Lock()
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def get_db():
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def get_db_write():
+    """
+    写操作用这个：加全局锁，确保串行。
+    """
+    with _write_lock:
+        conn = get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+```
+
+然后把 `service.py` 中 `process_message` 里的：
+
+```python
+with get_db() as conn:
+```
+
+改成：
+
+```python
+with get_db_write() as conn:
+```
+
+查询接口（`api_get_session`、`api_get_drafts` 等）仍然用 `get_db()`。
+
+---
+
+## 2.3 最简方案（如果你不想改太多）
+
+只在 `get_connection()` 中加两行：
+
+```python
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+```
+
+这通常就能解决问题。
+
+---
+
+# 三、验证
+
+修复后重启服务：
+
+```bash
+# 先删除旧数据库（WAL 模式切换后建议重建）
+rm -f data/app.db data/app.db-wal data/app.db-shm
+
+uvicorn main:app --port 8000
+```
+
+再跑测试：
+
+```bash
+python test_flow.py
+```
+
+如果还报错，用方案 2.2 加写锁。
+
+---
+
+# 四、总结
+
+| 原因 | 解决方案 |
+|---|---|
+| 并发写冲突 | `timeout=30` + `PRAGMA journal_mode=WAL` |
+| 线程池跨线程 | `check_same_thread=False` |
+| 多请求同时写 | 加 `threading.Lock()` 串行化 |
+| 旧数据库文件残留 | `rm data/app.db*` 重建 |
+
+
+---
+🙋**user**:
+---
+```
+我加了 线程锁之后，出现了死锁情况，都发生在连续两个请求。第一个请求在向LLM服务call api之后，未输出第二个请求就进来了，此时发生了死锁（两个请求过了很久都没有输出）。分析原因
+```
+
+---
+🤖**assistant**:
+---
+
+# 一、原因：锁的粒度太大，把 LLM API 调用锁在了里面
+
+## 1.1 当前代码的执行时序
+
+你的 `process_message` 结构是这样的：
+
+```python
+def process_message(message, resolver, extractor):
+    with get_db_write() as conn:       # ← 获取锁 🔒
+        resolution = resolver.resolve(conn, message)
+        message_id = upsert_message(conn, message)
+        drafts = list_drafts(conn)
+        history = list_recent_messages(conn)
+
+        llm_result = extractor.extract(...)  # ← 调用 LLM API，5~30秒！
+        #                                    锁一直被持有 🔒
+
+        for action in llm_result.actions:
+            apply_action(conn, ...)
+
+        touch_session(conn, ...)
+        return ProcessResult(...)
+                                       # ← 释放锁 🔓
+```
+
+## 1.2 两个请求的实际时序
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+线程1（请求1）:
+  ├─ 获取锁 🔒
+  ├─ resolve / upsert / list_drafts / list_history   （~5ms）
+  ├─ extractor.extract()                              （5~30秒！）
+  │   └─ 调用 LLM API，等待网络返回...
+  │      锁一直被持有 🔒🔒🔒🔒🔒🔒🔒🔒🔒🔒
+  ├─ apply_action / touch_session                     （~5ms）
+  └─ 释放锁 🔓
+
+线程2（请求2）:
+  ├─ 尝试获取锁...
+  │   被阻塞 ⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳⏳
+  │   （等待线程1释放锁，可能等 5~90 秒）
+  ├─ 终于获取到锁 🔒
+  ├─ 开始执行...
+  └─ 释放锁 🔓
+```
+
+**两个请求看起来都"卡住"了**：请求1在等 LLM API，请求2在等锁。
+
+## 1.3 为什么可能等非常久
+
+如果 LLM API 有重试机制（你之前设计的 3 次重试 + 指数退避）：
+
+```
+最坏情况：
+  第1次调用：超时 30 秒
+  第2次调用：超时 30 秒
+  第3次调用：超时 30 秒
+  总计：~90 秒
+
+线程2 在等锁，等了 90 秒才拿到。
+```
+
+如果 `timeout=30`（SQLite 连接超时），线程2 甚至可能在等锁的过程中就报 `database is locked`。
+
+## 1.4 这不是"死锁"，是"长时间阻塞"
+
+真正的死锁是**循环等待**，永远无法解除。
+
+你遇到的是**锁持有时间过长**，导致其他线程长时间阻塞。表现上很像死锁，但本质不同。
+
+---
+
+# 二、解决方案：把 LLM 调用移出锁
+
+## 2.1 核心原则
+
+```
+锁只保护数据库读写。
+网络 IO（LLM API）绝不能放在锁内。
+```
+
+## 2.2 拆分 `process_message` 为三段
+
+```python
+def process_message(
+    message: IncomingMessage,
+    resolver: SessionResolver,
+    extractor: ActionExtractor,
+) -> ProcessResult:
+
+    if not message.message_id:
+        message = message.model_copy(
+            update={"message_id": state_store.new_id("msg")}
+        )
+
+    # ════════════════════════════════════════════
+    # 阶段1：读取状态（需要锁，很快）
+    # ════════════════════════════════════════════
+    with get_db_write() as conn:
+        resolution = resolver.resolve(conn, message)
+        session = resolution.session
+
+        message_id = state_store.upsert_message(
+            conn, message=message, session_id=session.session_id,
+        )
+
+        drafts = state_store.list_drafts(conn, session.session_id)
+        history = state_store.list_recent_messages(
+            conn, session_id=session.session_id, limit=20,
+        )
+    # ← 锁释放 🔓，连接关闭
+
+    # ════════════════════════════════════════════
+    # 阶段2：调用 LLM（不需要锁，不需要数据库）
+    # ════════════════════════════════════════════
+    llm_result = extractor.extract(
+        session=session,
+        drafts=drafts,
+        history=history,
+        message=message,
+    )
+    # ← 这里可能耗时 5~30 秒，但没有持锁
+
+    # ════════════════════════════════════════════
+    # 阶段3：写入结果（需要锁，很快）
+    # ════════════════════════════════════════════
+    with get_db_write() as conn:
+        clarify_question = llm_result.clarify_question
+
+        for action in llm_result.actions:
+            local_clarify = apply_action(
+                conn,
+                session_id=session.session_id,
+                drafts=drafts,
+                action=action,
+                message_id=message_id,
+            )
+            if local_clarify and not clarify_question:
+                clarify_question = local_clarify
+            drafts = state_store.list_drafts(conn, session.session_id)
+
+        if llm_result.clarify_question:
+            state_store.append_event(
+                conn,
+                session_id=session.session_id,
+                draft_id=None,
+                message_id=message_id,
+                action_type=ActionType.CLARIFY,
+                field=None,
+                old_value=None,
+                new_value=llm_result.clarify_question,
+                reasoning="llm clarify",
+            )
+
+        state_store.touch_session(conn, session.session_id)
+
+        session = state_store.get_session(conn, session.session_id)
+        assert session is not None
+        drafts = state_store.list_drafts(conn, session.session_id)
+
+        return ProcessResult(
+            session=session,
+            drafts=drafts,
+            affected_drafts=state_store.list_affected_drafts(
+                conn, session.session_id, message_id,
+            ),
+            actions=llm_result.actions,
+            clarify_question=clarify_question,
+            message_id=message_id,
+            settled_session=resolution.settled_session,
+            settled_drafts=resolution.settled_drafts,
+        )
+    # ← 锁释放 🔓
+```
+
+## 2.3 拆分后的时序
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+线程1（请求1）:
+  ├─ 获取锁 🔒
+  ├─ resolve / upsert / list_drafts / list_history   （~5ms）
+  ├─ 释放锁 🔓
+  │
+  ├─ extractor.extract()                              （5~30秒）
+  │   └─ 调用 LLM API...
+  │      没有持锁！🔓🔓🔓🔓🔓🔓🔓🔓🔓🔓
+  │
+  ├─ 获取锁 🔒
+  ├─ apply_action / touch_session                     （~5ms）
+  └─ 释放锁 🔓
+
+线程2（请求2）:（在请求1调用 LLM 期间到达）
+  ├─ 尝试获取锁...
+  │   请求1已释放锁，立即获取 🔒
+  ├─ resolve / upsert / list_drafts / list_history   （~5ms）
+  ├─ 释放锁 🔓
+  │
+  ├─ extractor.extract()                              （5~30秒）
+  │   └─ 两个请求并行调用 LLM API！
+  │
+  ├─ 获取锁 🔒
+  ├─ apply_action / touch_session
+  └─ 释放锁 🔓
+```
+
+**两个请求可以并行调用 LLM API，只在数据库读写时短暂串行。**
+
+---
+
+# 三、阶段1和阶段3之间的状态一致性
+
+你可能担心：
+
+> 阶段1读完状态，释放锁；阶段3再获取锁写入。中间这段时间，状态会不会被其他请求改了？
+
+## 3.1 对于你的场景，风险极低
+
+同一个 `conversation_key` 下的消息，通常是**顺序到达**的。不太可能两个交易员在同一毫秒内发消息。
+
+## 3.2 如果要严谨，可以在阶段3开头加校验
+
+```python
+# 阶段3开头
+with get_db_write() as conn:
+    # 重新读取最新状态，检查是否有冲突
+    current_drafts = state_store.list_drafts(conn, session.session_id)
+
+    # 如果草稿数量或状态发生了重大变化，可以记录日志
+    if len(current_drafts) != len(drafts):
+        logger.warning(
+            "Drafts changed between read and write, session=%s, "
+            "expected=%d, actual=%d",
+            session.session_id, len(drafts), len(current_drafts),
+        )
+
+    # 用最新的 drafts 继续处理
+    drafts = current_drafts
+
+    # ... 后续 apply_action 等 ...
+```
+
+---
+
+# 四、`db.py` 最终版本
+
+```python
+import sqlite3
+import threading
+from contextlib import contextmanager
+
+from .config import DB_PATH
+
+_write_lock = threading.Lock()
+
+SCHEMA = """
+...（保持不变）
+"""
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def get_db():
+    """读操作用这个。"""
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def get_db_write():
+    """写操作用这个：加全局锁，确保串行。"""
+    with _write_lock:
+        conn = get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def init_db() -> None:
+    with get_db_write() as conn:
+        conn.executescript(SCHEMA)
+```
+
+---
+
+# 五、总结
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| 两个请求都卡住 | 锁包含了 LLM API 调用（5~90秒） | 把 LLM 调用移出锁 |
+| 锁持有时间过长 | `with get_db_write()` 包住了整个函数 | 拆成三段：读→LLM→写 |
+| 看起来像死锁 | 线程2等线程1释放锁，线程1在等 LLM API | 拆分后锁只持有几毫秒 |
+
+**一句话**：锁只保护数据库操作，网络 IO 永远不要放在锁里面。
+
