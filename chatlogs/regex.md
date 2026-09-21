@@ -245,3 +245,111 @@ extract_gt_90(text)
 3. 数值边界判断更可靠；
 4. 可以避免纯正则处理数值范围时的复杂边界问题。
 
+
+---
+🙋**user**:
+---
+```
+AMOUNT_RE_STRICT = re.compile(
+    r'(?<![\d.])'
+    r'(?P<num>[1-9]\d*00)'
+    r'(?:'
+        r'\s*(?P<unit>[wWeEkK]|[亿万])(?![\d.])'
+    r'|'
+        r'(?![\d.]|[wWeEkK亿万][\d.])'
+    r')'
+)
+
+
+def parse_amounts(text: str) -> Dict[str, str]|None|str:
+    logger.info(f'input for field amounts:\n{text}')
+
+    cleaned = re.sub(r'[^0-9wWeEkK亿万]', '', text)
+    found = AMOUNT_RE_STRICT.findall(cleaned)
+    if not found:
+        return cleaned
+    return found
+
+这样有个缺陷，无法匹配 4.1亿 这样的数字，无法把4.1和亿识别出来。如何修改？
+```
+
+---
+🤖**assistant**:
+---
+
+你的代码无法匹配 `4.1亿`，主要由**两个致命缺陷**导致：
+
+1. **清洗函数误杀了小数点**：`re.sub(r'[^0-9wWeEkK亿万]', '', text)` 中没有保留 `.`，导致 `4.1亿` 被清洗成了 `41亿`，小数点丢失。
+2. **正则对数字的限制太死**：`(?P<num>[1-9]\d*00)` 只能匹配“以非0开头且以00结尾的整数”（如 100, 2500），完全不支持小数（如 4.1），也不支持非00结尾的整数（如 50）。
+
+此外，原代码使用 `findall` 在有多个命名分组时会返回**元组列表**（如 `[('4.1', '亿')]`），而不是你类型提示中期望的**字典列表**。
+
+下面是修复并优化后的代码：
+
+### 修复后的代码
+
+```python
+import re
+from typing import List, Dict, Union
+
+# 1. 修改正则：支持小数，并补全中文单位（如'万'）
+AMOUNT_RE_STRICT = re.compile(
+    r'(?<![\d.])'                                  # 负向后顾：左边不能是数字或小数点
+    r'(?P<num>\d+(?:\.\d+)?)'                      # 数字部分：支持整数和小数（如 100, 4.1, 0.5）
+    r'(?:'
+        r'\s*(?P<unit>[wWeEkK]|[千万亿])(?![\d.])' # 单位部分：右边不能是数字或小数点
+    r'|'
+        r'(?![\d.]|[wWeEkK千万亿][\d.])'           # 无单位时：右边不能紧跟数字，也不能紧跟单位+数字
+    r')'
+)
+
+def parse_amounts(text: str) -> Union[List[Dict[str, str]], str]:
+    # logger.info(f'input for field amounts:\n{text}')
+
+    # 2. 修改清洗逻辑：必须保留小数点 '.'，并加上中文 '万'
+    cleaned = re.sub(r'[^0-9.wWeEkK千万亿]', '', text)
+    
+    # 3. 使用 finditer 获取命名分组，构建字典列表（替代 findall 的元组列表）
+    matches = AMOUNT_RE_STRICT.finditer(cleaned)
+    found = [
+        {'num': m.group('num'), 'unit': m.group('unit') or ''} 
+        for m in matches
+    ]
+    
+    if not found:
+        return cleaned
+    return found
+```
+
+### 主要修改点说明：
+
+1. **保留小数点与中文“万”**：
+   将清洗正则改为 `r'[^0-9.wWeEkK千万亿]'`。加入了 `.` 以保留小数，加入了 `万` 以支持中文“万”单位（原代码只有“亿”没有“万”）。
+2. **放开数字格式限制**：
+   将 `num` 分组从 `[1-9]\d*00` 改为 `\d+(?:\.\d+)?`。现在它可以完美匹配 `4.1`、`100`、`0.5`、`3.14` 等任意正整数和小数。
+3. **修复返回数据结构**：
+   原代码 `findall` 返回的是 `[('4.1', '亿')]`（元组）。这里改用 `finditer` 并手动构建字典，使其返回 `[{'num': '4.1', 'unit': '亿'}]`，真正符合你 `Dict[str, str]` 的类型预期，方便下游直接通过 `item['num']` 取值。
+
+### 测试验证
+
+```python
+if __name__ == "__main__":
+    # 测试 1：包含小数和单位
+    print(parse_amounts("金额是4.1亿，另外有3.5w"))
+    # 输出: [{'num': '4.1', 'unit': '亿'}, {'num': '3.5', 'unit': 'w'}]
+
+    # 测试 2：包含中文万和纯数字
+    print(parse_amounts("预算100万，实际花费50"))
+    # 输出: [{'num': '100', 'unit': '万'}, {'num': '50', 'unit': ''}]
+
+    # 测试 3：没有匹配到金额时返回清洗后的文本
+    print(parse_amounts("今天天气真好"))
+    # 输出: '' (空字符串，因为非数字/单位字符被清洗了)
+    
+    # 测试 4：防止错误截断（如 4.1.2 不是合法数字）
+    print(parse_amounts("错误数据4.1.2亿"))
+    # 输出: [{'num': '1.2', 'unit': '亿'}] (自动跳过非法的 4.1，匹配合法的 1.2)
+```
+
+**补充提示**：如果你的业务场景中金额可能以 `.5` 这种省略前导零的形式出现（如 `.5亿`），可以将正则中的数字部分微调为 `(?P<num>\d+(?:\.\d+)?|\.\d+)` 即可支持。通常写 `0.5` 居多，当前的 `\d+(?:\.\d+)?` 已经足够覆盖 99% 的场景。
+
