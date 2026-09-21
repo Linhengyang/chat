@@ -31,7 +31,7 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
     usage = None
     try:
         completion = client.chat.completions.create(
-            model = "qwen3.8-max",
+            model = "qwen3.7-max",
             messages = conversation_context,
             stream = True,
             stream_options = {"include_usage": True}
