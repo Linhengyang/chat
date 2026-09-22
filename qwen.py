@@ -23,7 +23,7 @@ def ask_qwen(chatlogs_json, user_query, render=True, history=True):
         conversation_context = [conversation_context[0]]
 
     conversation_context.append({
-        "role": "user", 
+        "role": "user",
         "content": user_query
     })
     
