@@ -670,3 +670,149 @@ dpkg -l | grep cuda
 # 预期输出：无任何输出，或仅显示已卸载的 'rc' 状态包（可通过前文提到的 dpkg --purge 命令清理）
 ```
 
+
+---
+🙋**user**:
+---
+```
+如何在ubuntu安装uv？
+然后给我uv管理python环境的基本教程
+```
+
+---
+🤖**assistant**:
+---
+
+`uv` 是由 Astral 公司（Ruff 的开发者）使用 Rust 编写的极速 Python 包和项目管理器。它旨在替代 `pip`、`pip-tools`、`virtualenv`、`pyenv`、`poetry` 和 `pipx` 等工具，提供统一的 Python 环境管理体验。
+
+以下是在 Ubuntu 上安装 `uv` 及使用其管理 Python 环境的完整指南。
+
+### 1. 在 Ubuntu 上安装 uv
+
+官方推荐使用独立安装脚本，这会将 `uv` 安装到用户目录，不污染系统级环境。
+
+```bash
+# 下载并执行官方安装脚本
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 重新加载环境变量，使 uv 命令在当前终端生效
+source $HOME/.local/bin/env
+
+# 验证安装
+uv --version
+```
+
+*(注：未来需要更新 `uv` 时，只需运行 `uv self update`。)*
+
+---
+
+### 2. uv 管理 Python 环境基本教程
+
+`uv` 提供了两种主要的工作流：**项目工作流**（基于 `pyproject.toml`，替代 Poetry/Pipenv）和 **Pip/虚拟环境工作流**（基于 `requirements.txt`，替代 venv+pip）。
+
+#### 2.1 管理 Python 解释器版本 (替代 pyenv)
+`uv` 可以直接下载、安装和管理不同版本的 Python 解释器，无需依赖操作系统的包管理器。
+
+```bash
+# 查看所有可安装的 Python 版本
+uv python list
+
+# 安装特定版本的 Python (例如 3.12)
+uv python install 3.12
+
+# 查看已安装的 Python 版本
+uv python list --only-installed
+
+# 为当前目录固定 Python 版本 (会生成 .python-version 文件)
+uv python pin 3.12
+```
+
+#### 2.2 项目管理工作流 (替代 Poetry / Pipenv)
+适用于标准的 Python 项目，使用 `pyproject.toml` 管理依赖，并生成跨平台的 `uv.lock` 锁文件。
+
+```bash
+# 初始化一个新项目 (创建目录、pyproject.toml、hello.py 等)
+uv init my_project
+cd my_project
+
+# 添加生产依赖 (自动更新 pyproject.toml、uv.lock，并安装到虚拟环境)
+uv add requests numpy
+
+# 添加开发/测试依赖
+uv add --dev pytest ruff
+
+# 移除依赖
+uv remove numpy
+
+# 同步环境 (根据 uv.lock 精确安装所有依赖，清理未声明的包)
+uv sync
+
+# 在项目的虚拟环境中运行命令或脚本 (无需手动激活虚拟环境)
+uv run python hello.py
+uv run pytest
+```
+
+#### 2.3 虚拟环境与 Pip 工作流 (替代 venv + pip)
+如果你不想使用 `pyproject.toml`，只需传统的虚拟环境和 `requirements.txt`，`uv` 提供了完全兼容且极速的 `pip` 替代命令。
+
+```bash
+# 创建虚拟环境 (默认使用系统 Python 或 .python-version 指定的版本)
+uv venv
+
+# 创建指定 Python 版本的虚拟环境
+uv venv --python 3.11
+
+# 激活虚拟环境 (与标准 venv 激活方式完全相同)
+source .venv/bin/activate
+
+# 安装包 (替代 pip install，速度提升 10-100 倍)
+uv pip install requests
+uv pip install -r requirements.txt
+
+# 卸载包
+uv pip uninstall requests
+
+# 导出当前环境的依赖
+uv pip freeze > requirements.txt
+```
+
+#### 2.4 运行全局 CLI 工具 (替代 pipx)
+`uv` 提供了 `uvx` 命令（等同于 `uv tool run`），用于在隔离的临时环境中运行 Python 命令行工具，而不将它们安装到全局或项目环境中。
+
+```bash
+# 运行 ruff 检查当前目录 (自动下载 ruff 并在临时环境中运行)
+uvx ruff check .
+
+# 运行 httpie 发起请求
+uvx httpie GET https://example.com
+
+# 将某个工具全局安装到用户环境 (使其在任何地方可通过命令直接调用)
+uv tool install ruff
+```
+
+#### 2.5 运行带有内联依赖的单文件脚本 (PEP 723)
+对于不需要初始化为完整项目的独立脚本，可以在脚本头部声明依赖，`uv` 会自动处理环境。
+
+创建一个名为 `script.py` 的文件：
+```python
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "requests",
+#     "rich",
+# ]
+# ///
+
+import requests
+from rich import print
+
+response = requests.get("https://api.github.com")
+print(response.json())
+```
+
+运行该脚本：
+```bash
+# uv 会自动读取头部声明，创建临时环境，安装依赖并执行
+uv run script.py
+```
+
