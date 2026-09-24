@@ -7,11 +7,10 @@ authors = [
     { name = "linhengyang", email = "linhengyang1@outlook.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "openai>=3.19.2",
+    "python-dotenv>=1.2.3",
+]
 
 [project.scripts]
 chat = "chat:main"
-
-[build-system]
-requires = ["uv_build>=0.12.18,<0.13.0"]
-build-backend = "uv_build"
