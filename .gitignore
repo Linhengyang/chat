@@ -2,3 +2,6 @@
 .env
 temp/*
 ask.py
+*.pyc
+__pycache__
+.venv
